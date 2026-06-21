@@ -3309,6 +3309,77 @@ mod tests {
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
     }
 
+    // ---- Shared helpers for deferred-remap deleted-fragment tests ----
+
+    /// Open the fragment-reuse index of a dataset that has one.
+    async fn open_dataset_fri(dataset: &Dataset) -> lance_index::frag_reuse::FragReuseIndex {
+        let meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("fragment reuse index must exist after deferred compaction");
+        let details = load_frag_reuse_index_details(dataset, &meta).await.unwrap();
+        open_frag_reuse_index(meta.uuid, details.as_ref())
+            .await
+            .unwrap()
+    }
+
+    /// Assert the FRI maps every probed address of `deleted_frags` to None and
+    /// keeps (maps to Some) the first address of each `live_frags`.
+    async fn assert_fri_prunes(dataset: &Dataset, deleted_frags: &[u32], live_frags: &[u32]) {
+        let fri = open_dataset_fri(dataset).await;
+        let mut leaked = Vec::new();
+        for &f in deleted_frags {
+            for off in [0u32, 1, 50, 99] {
+                let addr = u64::from(RowAddress::new_from_parts(f, off));
+                if let Some(mapped) = fri.remap_row_id(addr) {
+                    leaked.push((f, off, mapped));
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "deleted fragments {deleted_frags:?} not pruned by the FRI; \
+             remap_row_id returned Some for {leaked:?}",
+        );
+        for &f in live_frags {
+            let addr = u64::from(RowAddress::new_from_parts(f, 0));
+            assert!(
+                fri.remap_row_id(addr).is_some(),
+                "surviving fragment {f} was over-pruned by the FRI",
+            );
+        }
+    }
+
+    /// `n` fragments of `rows_per_frag` rows (i = 0..n*rpf) with a scalar BTREE
+    /// index on `i`. A cheap stand-in (no vector training) when only FRI-level
+    /// pruning is under test.
+    async fn dataset_with_btree(n: usize, rows_per_frag: usize) -> Dataset {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch((n * rows_per_frag) as i32),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: rows_per_frag,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+    }
+
     // Regression test for https://github.com/lancedb/lance/issues/7374
     // "Vector index can become corrupted when compaction is deferred"
     // A fully-deleted fragment must be pruned from the vector index. With
@@ -3367,35 +3438,8 @@ mod tests {
         assert!(metrics.fragments_removed > 0);
         assert!(metrics.fragments_added > 0);
 
-        // --- FRI-level check: fragment 4 must be pruned from the index ---
-        let frag_reuse_index_meta = dataset
-            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-            .await
-            .unwrap()
-            .expect("fragment reuse index must exist after deferred compaction");
-        let details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
-            .await
-            .unwrap();
-        let fri = open_frag_reuse_index(frag_reuse_index_meta.uuid, details.as_ref())
-            .await
-            .unwrap();
-
-        // The fragment-reuse index must map every address of the fully-deleted
-        // fragment 4 to None (pruned). Returning Some(addr) means the vector
-        // index keeps a dangling reference to a fragment that no longer exists.
-        let mut bad = Vec::new();
-        for offset in [0u32, 1, 100, 500, 999] {
-            let addr = u64::from(RowAddress::new_from_parts(4, offset));
-            if let Some(mapped) = fri.remap_row_id(addr) {
-                bad.push((offset, mapped));
-            }
-        }
-        assert!(
-            bad.is_empty(),
-            "fully-deleted fragment 4 addresses were NOT pruned by the FRI; \
-             remap_row_id returned Some for offsets {:?} (should be None)",
-            bad
-        );
+        // FRI-level: fragment 4 must be pruned; surviving fragment 0 kept.
+        assert_fri_prunes(&dataset, &[4], &[0]).await;
 
         // --- End-to-end: vector search must succeed and not return ghost rows ---
         let batch = dataset
@@ -3500,44 +3544,11 @@ mod tests {
         .await
         .unwrap();
 
-        let frag_reuse_index_meta = dataset
-            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-            .await
-            .unwrap()
-            .expect("fragment reuse index must exist after deferred compaction");
-        let details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
-            .await
-            .unwrap();
-        let fri = open_frag_reuse_index(frag_reuse_index_meta.uuid, details.as_ref())
-            .await
-            .unwrap();
-
         // Original fragments 0 and 1 were merged (comp 1) into the fragment that
-        // was then deleted. Their addresses chain forward to that removed merge
-        // target, so the FRI must map them to None.
-        let mut bad = Vec::new();
-        for frag in [0u32, 1] {
-            for offset in [0u32, 1, 500, 999] {
-                let addr = u64::from(RowAddress::new_from_parts(frag, offset));
-                if let Some(mapped) = fri.remap_row_id(addr) {
-                    bad.push((frag, offset, mapped));
-                }
-            }
-        }
-        assert!(
-            bad.is_empty(),
-            "addresses of the deleted merge target were NOT pruned by the FRI; \
-             remap_row_id returned Some for {:?} (should be None)",
-            bad
-        );
-
-        // Original fragment 2 (i[2000,3000)) survived both compactions: its
-        // addresses must still remap to a live fragment, not be over-pruned.
-        let survivor = u64::from(RowAddress::new_from_parts(2, 0));
-        assert!(
-            fri.remap_row_id(survivor).is_some(),
-            "a surviving row was incorrectly pruned by the FRI"
-        );
+        // was then deleted, so their addresses chain forward to the removed merge
+        // target and must map to None. Fragment 2 survived both compactions and
+        // must still remap (not be over-pruned).
+        assert_fri_prunes(&dataset, &[0, 1], &[2]).await;
 
         // End-to-end: vector search succeeds, returns no ghosts from [0,2000),
         // and still returns live rows.
@@ -3563,6 +3574,200 @@ mod tests {
             ghosts
         );
         assert!(i_col.len() > 0, "vector search returned no live rows");
+    }
+
+    // End-to-end correctness must survive the physical remap + FRI trim that
+    // closes the deferred-compaction window: after the FRI is gone, a
+    // fully-deleted fragment must not resurface (its coverage keeps it masked
+    // even though the rebuilt index data isn't pruned -- see lance#1610).
+    #[tokio::test]
+    async fn test_defer_index_remap_fully_deleted_fragment_after_physical_remap_trim() {
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(
+                RandomVector::new().vec_width(128).named("vec".to_owned()),
+            ))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(10_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vector".into()),
+                &VectorIndexParams::ivf_pq(10, 8, 8, MetricType::L2, 50),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset.delete("i >= 4000 AND i < 5000").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100_000,
+                materialize_deletions: true,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Physically remap the vector index, then trim the FRI to zero versions.
+        remapping::remap_column_index(&mut dataset, &["vec"], Some("vector".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+        // With the FRI gone, nothing masks stale entries at load time anymore.
+        // A full-projection KNN forces a take; a surviving dead-fragment ref
+        // would error here or resurrect a deleted id.
+        let batch = dataset
+            .scan()
+            .nearest("vec", &Float32Array::from(vec![0.0f32; 128]), 200)
+            .unwrap()
+            .project(&["i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("KNN after physical remap + FRI trim must succeed");
+        let i_col = batch.column(0).as_primitive::<Int32Type>();
+        let ghosts: Vec<i32> = i_col
+            .values()
+            .iter()
+            .copied()
+            .filter(|&v| (4000..5000).contains(&v))
+            .collect();
+        assert!(ghosts.is_empty(), "post-trim ghosts: {:?}", ghosts);
+    }
+
+    // Several whole-fragment deletions before one deferred compaction: every
+    // deleted fragment must be tracked, since `removed_frags` is a union.
+    #[tokio::test]
+    async fn test_defer_index_remap_multiple_fully_deleted_fragments() {
+        let mut dataset = dataset_with_btree(10, 100).await;
+        assert_eq!(dataset.get_fragments().len(), 10);
+
+        // Fully delete fragments 2 (i[200,300)) and 7 (i[700,800)).
+        dataset
+            .delete("(i >= 200 AND i < 300) OR (i >= 700 AND i < 800)")
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 8);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                materialize_deletions: true,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_fri_prunes(&dataset, &[2, 7], &[0, 9]).await;
+    }
+
+    // A fragment left untouched by an earlier deferred compaction and then fully
+    // deleted is orphaned at its ORIGINAL id (it never entered a group, so it
+    // reaches `remap_row_id` by pass-through, not by chaining). It must still be
+    // pruned.
+    #[tokio::test]
+    async fn test_defer_index_remap_survivor_deleted_across_versions() {
+        let mut dataset = dataset_with_btree(5, 100).await;
+
+        // Compaction 1: target 200 bins {0,1} and {2,3}; fragment 4 is left alone.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragments().len(),
+            3,
+            "compaction 1 should leave the trailing fragment 4 untouched"
+        );
+
+        // Fully delete the surviving original fragment 4 (i[400,500)).
+        dataset.delete("i >= 400 AND i < 500").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // Compaction 2 merges the two remaining (merged) fragments.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_fri_prunes(&dataset, &[4], &[0]).await;
+    }
+
+    // Reverse ordering: deferred compaction FIRST, then a delete during the FRI
+    // window. The delete lands on the new merged fragment; its deletion vector
+    // must be honored on read so deleted rows don't resurface.
+    #[tokio::test]
+    async fn test_defer_index_remap_then_delete_during_window() {
+        let mut dataset = dataset_with_btree(6, 100).await; // 600 rows
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "all fragments merge into one"
+        );
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "deferred compaction must leave a fragment-reuse index"
+        );
+
+        // Delete a slice of the merged fragment within the FRI window.
+        dataset.delete("i >= 100 AND i < 200").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 500);
+        assert_eq!(
+            dataset
+                .count_rows(Some("i >= 100 AND i < 200".to_owned()))
+                .await
+                .unwrap(),
+            0,
+            "rows deleted during the FRI window resurfaced"
+        );
     }
 
     #[tokio::test]
