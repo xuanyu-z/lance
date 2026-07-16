@@ -2463,6 +2463,203 @@ mod tests {
         assert_eq!(results.num_rows(), 20);
     }
 
+    // Distributed NGram build: one segment per fragment via `execute_uncommitted`,
+    // then `merge_existing_index_segments` consolidates them into a single segment
+    // whose unioned posting lists answer `contains()` across all rows.
+    #[tokio::test]
+    async fn test_ngram_merge_existing_index_segments() {
+        // Collect the sorted ids of rows matching `filter`.
+        async fn matching_ids(dataset: &Dataset, filter: &str) -> Vec<i32> {
+            let batch = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .filter(filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids: Vec<i32> = batch
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batches = RecordBatchIterator::new(
+            vec![
+                Ok(create_text_batch(0, 10)),
+                Ok(create_text_batch(10, 20)),
+                Ok(create_text_batch(20, 30)),
+            ],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 5,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // "content" appears in rows with id % 3 == 0, i.e. in every fragment.
+        let filter = "contains(text, 'content')";
+        let expected = matching_ids(&dataset, filter).await;
+        assert!(!expected.is_empty());
+
+        // One NGram segment per fragment (three segments, so the merge also
+        // exercises the intermediate spill of the pairwise fold).
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::NGram);
+        let mut input_segments = Vec::new();
+        let mut expected_fragments = roaring::RoaringBitmap::new();
+        for fragment in dataset.get_fragments() {
+            expected_fragments.insert(fragment.id() as u32);
+            input_segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(input_segments.len() >= 2);
+
+        let merged = dataset
+            .merge_existing_index_segments(input_segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .expect("merged ngram segment should have fragment coverage"),
+            &expected_fragments
+        );
+        assert!(
+            merged
+                .index_details
+                .as_ref()
+                .expect("merged ngram segment should have index details")
+                .type_url
+                .ends_with("NGramIndexDetails")
+        );
+
+        dataset
+            .commit_existing_index_segments("text_ngram", "text", vec![merged])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("text_ngram")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The plan must consult the ngram index (with a recheck refine step).
+        let plan = dataset
+            .scan()
+            .filter(filter)
+            .unwrap()
+            .explain_plan(true)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "expected the ngram index in the plan:\n{plan}"
+        );
+
+        // The ngram index cannot return false negatives, so a merge that lost
+        // postings would drop matches; the indexed scan must agree with the
+        // pre-index full scan.
+        assert_eq!(matching_ids(&dataset, filter).await, expected);
+
+        // And it must agree with a single non-segmented index built over the
+        // same data.
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                Some("text_ngram".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(matching_ids(&dataset, filter).await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_ngram_merge_rejects_mixed_segment_types() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids.len(), 2);
+
+        let ngram_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::NGram);
+        let ngram_segment =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &ngram_params)
+                .name("text_idx".to_string())
+                .fragments(vec![fragment_ids[0]])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let inverted_params = InvertedIndexParams::default();
+        let inverted_segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["text"],
+            IndexType::Inverted,
+            &inverted_params,
+        )
+        .name("text_idx".to_string())
+        .fragments(vec![fragment_ids[1]])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+        let err = dataset
+            .merge_existing_index_segments(vec![ngram_segment, inverted_segment])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("same supported index type"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_btree_merge_existing_index_segments() {
         use datafusion::common::ScalarValue;

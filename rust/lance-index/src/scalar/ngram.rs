@@ -18,6 +18,7 @@ use super::{
 };
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
+use crate::progress::IndexBuildProgress;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
@@ -1407,6 +1408,98 @@ impl NGramIndexBuilder {
     }
 }
 
+/// Merge multiple ngram indexes into a single index written to `dest_store`.
+///
+/// Each source postings file is streamed in token order and posting lists for
+/// the same token are unioned, reusing the builder's sorted spill-stream merge.
+/// Segment-merge callers pass segments built from disjoint fragment sets, so
+/// the source posting lists hold disjoint row addresses, but the union is
+/// correct even if they were to overlap.
+pub async fn merge_ngram_indices(
+    source_indices: &[&NGramIndex],
+    dest_store: &dyn IndexStore,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<CreatedIndex> {
+    if source_indices.is_empty() {
+        return Err(Error::invalid_input(
+            "NGram segment merge requires at least one source segment".to_string(),
+        ));
+    }
+
+    async fn postings_stream(
+        source: &NGramIndex,
+    ) -> Result<stream::BoxStream<'static, Result<NGramIndexSpillState>>> {
+        let reader = source.store.open_index_file(POSTINGS_FILENAME).await?;
+        Ok(NGramIndexBuilder::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.boxed())
+    }
+
+    progress
+        .stage_start(
+            "merge_ngram_segments",
+            Some(source_indices.len() as u64),
+            "segments",
+        )
+        .await?;
+
+    let file = if let [single] = source_indices {
+        // Nothing to merge; copy the postings file as-is.
+        single
+            .store
+            .copy_index_file(POSTINGS_FILENAME, dest_store)
+            .await?
+    } else {
+        // Fold the sources together pairwise.  Intermediate results go to a
+        // local temporary store; the final merge streams straight into
+        // `dest_store`.
+        let tmpdir = TempDir::default();
+        let spill_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut acc = postings_stream(source_indices[0]).await?;
+        progress.stage_progress("merge_ngram_segments", 1).await?;
+        for (idx, source) in source_indices[..source_indices.len() - 1]
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let right = postings_stream(source).await?;
+            let mut writer = spill_store
+                .new_index_file(
+                    &NGramIndexBuilder::spill_filename(idx),
+                    POSTINGS_SCHEMA.clone(),
+                )
+                .await?;
+            NGramIndexBuilder::merge_spill_streams(acc, right, writer.as_mut()).await?;
+            acc = NGramIndexBuilder::stream_spill(spill_store.clone(), idx)
+                .await?
+                .boxed();
+            progress
+                .stage_progress("merge_ngram_segments", (idx + 1) as u64)
+                .await?;
+        }
+
+        let right = postings_stream(source_indices[source_indices.len() - 1]).await?;
+        let mut writer = dest_store
+            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+            .await?;
+        let file = NGramIndexBuilder::merge_spill_streams(acc, right, writer.as_mut()).await?;
+        progress
+            .stage_progress("merge_ngram_segments", source_indices.len() as u64)
+            .await?;
+        file
+    };
+    progress.stage_complete("merge_ngram_segments").await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default()).unwrap(),
+        index_version: NGRAM_INDEX_VERSION,
+        files: vec![file],
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct NGramIndexPlugin;
 
@@ -1447,15 +1540,13 @@ impl BasicTrainer for NGramIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "NGram index does not support fragment training".into(),
-            ));
-        }
-
+        // `fragment_ids` is ignored: the caller has already restricted `data`
+        // to the requested fragments and the ngram index has no per-fragment
+        // shard layout, so a fragment-scoped (segment) build is just a normal
+        // build over the filtered rows.
         let file = Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
