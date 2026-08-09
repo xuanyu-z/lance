@@ -165,6 +165,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -179,6 +180,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -202,6 +204,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -215,6 +218,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -239,6 +243,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -253,6 +258,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -277,6 +283,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -291,6 +298,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -328,6 +336,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -349,6 +358,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -395,6 +405,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -408,6 +419,7 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -482,6 +494,10 @@ mod tests {
         assert_eq!(shard1_sstable.generation, 10); // Should still be 10
     }
 
+    /// The system index holds the catch-up positions the WAL pod retires SSTables against.
+    /// Erasing it through the ordinary index API would leave the table claiming
+    /// nothing was ever compacted while the SSTables are already gone.
+
     #[test]
     fn test_empty_compacted_sstables_noop() {
         let mut indices = Vec::new();
@@ -522,6 +538,7 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
+                require_index_catchup: false,
             },
             None,
         );

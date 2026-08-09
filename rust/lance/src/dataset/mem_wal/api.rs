@@ -12,6 +12,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
+use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use uuid::Uuid;
@@ -229,6 +230,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             Operation::CreateIndex {
                 new_indices: vec![index_meta],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -469,9 +471,33 @@ pub trait DatasetMemWalExt {
     /// and maintained indexes, then call [`InitializeMemWalBuilder::execute`].
     fn initialize_mem_wal(&mut self) -> InitializeMemWalBuilder<'_>;
 
+    /// Whether this table requires recorded index catch-up.
+    ///
+    /// When true, an index absent from `index_catchup` is *not* caught up, and
+    /// its shard's SSTables must keep being served. When false the field is not
+    /// maintained and absence carries no information. Both feature words must
+    /// agree; a half-set manifest is refused when it is read.
+    fn requires_mem_wal_index_catchup(&self) -> bool {
+        false
+    }
+
     /// Return the MemWAL index details for this dataset, if MemWAL is initialized.
     async fn mem_wal_index_details(&self) -> Result<Option<MemWalIndexDetails>> {
         Ok(None)
+    }
+
+    /// Require a recorded index catch-up before an SSTable stops being served.
+    ///
+    /// Until this is called, a missing index-coverage entry reads as "fully
+    /// caught up". Afterwards it reads as "not caught up", so an SSTable is served
+    /// until some commit shows the indexes contain its rows.
+    ///
+    /// One-way: there is no matching deactivate, because a table that has
+    /// already retired SSTables against a recorded catch-up cannot go back to
+    /// treating missing coverage as caught up. Calling it on an already-active
+    /// table succeeds and changes nothing.
+    async fn require_mem_wal_index_catchup(&mut self) -> Result<()> {
+        Ok(())
     }
 
     /// List current MemWAL shard IDs from object storage directory listing.
@@ -546,12 +572,41 @@ impl DatasetMemWalExt for Dataset {
         InitializeMemWalBuilder::new(self)
     }
 
+    fn requires_mem_wal_index_catchup(&self) -> bool {
+        self.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+            && self.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
+    }
+
     async fn mem_wal_index_details(&self) -> Result<Option<MemWalIndexDetails>> {
         let Some(index_meta) = self.load_index_by_name(MEM_WAL_INDEX_NAME).await? else {
             return Ok(None);
         };
 
         load_mem_wal_index_details(index_meta).map(Some)
+    }
+
+    async fn require_mem_wal_index_catchup(&mut self) -> Result<()> {
+        if self.load_index_by_name(MEM_WAL_INDEX_NAME).await?.is_none() {
+            return Err(Error::invalid_input(
+                "Cannot require MemWAL index catch-up: MemWAL is not initialized on \
+                 this dataset.",
+            ));
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: Vec::new(),
+                require_index_catchup: true,
+            },
+            None,
+        );
+        // Assigned back: leaving the receiver on the pre-activation manifest
+        // would report success while `self` still reads as legacy.
+        *self = CommitBuilder::new(Arc::new(self.clone()))
+            .execute(transaction)
+            .await?;
+        Ok(())
     }
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {

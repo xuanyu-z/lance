@@ -557,6 +557,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => self.check_compacted_sstables_conflict(
                     other_compacted_sstables,
                     self_compacted_sstables,
@@ -738,6 +739,7 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // CreateIndex of MemWalIndex is compatible with UpdateMemWalState
                     // as they can be rebased on each other
@@ -1473,13 +1475,17 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        // Activation rebases like any other MemWAL state update; its preconditions
+        // are re-checked against the rebased index list when the commit applies.
         if let Operation::UpdateMemWalState {
             compacted_sstables: self_compacted_sstables,
+            ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
+                    ..
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
                     // the same shard's compacted SSTable
@@ -1881,9 +1887,16 @@ impl<'a> TransactionRebase<'a> {
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
+        // `mem_wal_index_catchup_advances` is deliberately carried through the
+        // rebase untouched: it names the exact segment set the repair expects,
+        // and apply-time validation re-checks that against the rebased final
+        // index list. If an ordinary reindex won the race, the expected set no
+        // longer matches and the repair fails rather than claiming coverage for
+        // an index it did not build.
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
+            ..
         } = &mut self.transaction.operation
         {
             // Handle FRAG_REUSE_INDEX rebasing
@@ -2668,6 +2681,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index0.clone()],
                 removed_indices: vec![index0.clone()],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             Operation::Delete {
                 updated_fragments: vec![fragment0.clone()],
@@ -2810,6 +2824,7 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![index0.clone()],
                     removed_indices: vec![index0],
+                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 // Conflicts with row-id-changing operations and same-name CreateIndex.
                 [
@@ -3229,6 +3244,7 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![],
                     removed_indices: vec![],
+                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 Compatible,
             ),
@@ -3292,6 +3308,7 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
+                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -3607,6 +3624,7 @@ mod tests {
                 Operation::CreateIndex {
                     new_indices: vec![index],
                     removed_indices: vec![],
+                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 None,
             ),
@@ -3668,6 +3686,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index0.clone()],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3688,6 +3707,7 @@ mod tests {
                     ..index0
                 }],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3696,6 +3716,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![index1],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -3724,6 +3745,7 @@ mod tests {
                         files: None,
                     }],
                     removed_indices: vec![],
+                    mem_wal_index_catchup_advances: Vec::new(),
                 },
                 None,
             ),
@@ -3790,6 +3812,7 @@ mod tests {
                     Operation::CreateIndex {
                         new_indices: vec![ngram_index(covered_fragment)],
                         removed_indices: vec![],
+                        mem_wal_index_catchup_advances: Vec::new(),
                     },
                     None,
                 ),
@@ -4487,6 +4510,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4495,6 +4519,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4525,6 +4550,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4533,6 +4559,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4564,6 +4591,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4572,6 +4600,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4603,6 +4632,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4611,6 +4641,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4652,6 +4683,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -4661,6 +4693,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4686,6 +4719,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
+                require_index_catchup: false,
             },
             None,
         );
@@ -4723,6 +4757,7 @@ mod tests {
             Operation::CreateIndex {
                 new_indices: vec![mem_wal_index],
                 removed_indices: vec![],
+                mem_wal_index_catchup_advances: Vec::new(),
             },
             None,
         );
@@ -4732,6 +4767,7 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
+                require_index_catchup: false,
             },
             None,
         );
