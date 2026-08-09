@@ -2973,6 +2973,10 @@ impl Transaction {
             Operation::UpdateMemWalState {
                 compacted_sstables, ..
             } => {
+                // Index-only operation: the fragment list carries over
+                // untouched. Without this the commit publishes a manifest with
+                // no fragments, dropping every row in the table.
+                final_fragments.extend(maybe_existing_fragments?.clone());
                 update_mem_wal_index_compacted_sstables(
                     &mut final_indices,
                     new_version,

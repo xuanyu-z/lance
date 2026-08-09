@@ -12,9 +12,9 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -853,6 +853,44 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// `UpdateMemWalState` touches indexes, not data. It must carry the
+    /// fragment list forward.
+    ///
+    /// The operation builds its manifest from scratch, so a fragment list left
+    /// unpopulated is published as an empty one — every row in the table
+    /// disappears, silently and with no conflict raised. Activation is the
+    /// first caller to run this on a table that already holds data.
+    #[tokio::test]
+    async fn update_mem_wal_state_preserves_the_fragments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/t", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader =
+            RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2, 3]))], schema.clone());
+        let mut ds = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        ds.initialize_mem_wal().unsharded().execute().await.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+        let fragments_before: Vec<u64> = ds.fragments().iter().map(|f| f.id).collect();
+
+        ds.require_mem_wal_index_catchup().await.unwrap();
+
+        assert_eq!(
+            ds.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            fragments_before,
+            "the activation commit dropped fragments"
+        );
+        assert_eq!(
+            ds.count_rows(None).await.unwrap(),
+            3,
+            "the activation commit dropped rows"
+        );
+        // And from storage, not just the in-memory handle.
+        let reopened = Dataset::open(&uri).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 3);
     }
 
     #[tokio::test]
