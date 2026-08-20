@@ -34,10 +34,7 @@ use lance_file::{
 use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{
-    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
-};
+use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
@@ -505,12 +502,6 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
-        /// Requests the one-way migration to required index catch-up.
-        ///
-        /// One-way because returning to legacy semantics — where a missing
-        /// coverage entry reads as "fully caught up" — is unsafe once any
-        /// SSTable has been retired against a recorded catch-up position.
-        require_index_catchup: bool,
     },
 
     /// Clone a dataset.
@@ -1286,13 +1277,11 @@ impl PartialEq for Operation {
             (
                 Self::UpdateMemWalState {
                     compacted_sstables: a_compacted,
-                    require_index_catchup: a_activate,
                 },
                 Self::UpdateMemWalState {
                     compacted_sstables: b_compacted,
-                    require_index_catchup: b_activate,
                 },
-            ) => compare_vec(a_compacted, b_compacted) && a_activate == b_activate,
+            ) => compare_vec(a_compacted, b_compacted),
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
@@ -1829,79 +1818,13 @@ impl Transaction {
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
-        // Read below the reader validation boundary, so nothing else refuses a
-        // half-set manifest here: the flag reset would quietly drop the lone bit
-        // and republish an undefined state as legacy.
-        validate_mem_wal_index_catchup_flags(&manifest)?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
-        // A version from before catch-up was required carries MemWAL state this
-        // protocol never validated -- catch-up values activation deliberately
-        // cleared, or compaction progress it deliberately refused to trust.
-        // Keeping the bit would republish those as if this protocol had recorded
-        // them. Refuse instead: sanitizing is not possible here, because both
-        // fields would have to be re-derived from data Lance cannot see.
-        let current_requires = current_manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP
-            != 0
-            || current_manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
-        let restored_requires = manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
-            && manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0;
-        if current_requires && !restored_requires {
-            return Err(Error::invalid_input(format!(
-                "Cannot restore version {version}: this table requires MemWAL index \
-                 catch-up and that version predates it, so its recorded catch-up and \
-                 compaction progress were never validated by this protocol"
-            )));
-        }
-        inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
         Ok((manifest, indices))
-    }
-
-    /// Require index catch-up on a table that has never required it.
-    ///
-    /// One-way, because returning to legacy semantics -- where a missing
-    /// coverage entry reads as "fully caught up" -- is unsafe once any SSTable
-    /// has been retired against a recorded catch-up position.
-    fn require_index_catchup(final_indices: &mut [IndexMetadata], new_version: u64) -> Result<()> {
-        let Some(pos) = final_indices
-            .iter()
-            .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
-        else {
-            return Err(Error::invalid_input(format!(
-                "Cannot require MemWAL index catch-up: the {} system index does \
-                 not exist on this table",
-                MEM_WAL_INDEX_NAME
-            )));
-        };
-
-        let mut details = load_mem_wal_index_details(final_indices[pos].clone())?;
-
-        // The beta protocol wrote compaction progress that was never an active
-        // retirement record, and Lance cannot check those numbers against WAL
-        // shard manifests. Trusting them would let the first trim after
-        // activation delete SSTables no commit copied in, so a table carrying
-        // them must be drained through an explicit migration instead.
-        if !details.compacted_sstables.is_empty() {
-            return Err(Error::invalid_input(
-                "Cannot require MemWAL index catch-up: the table already records \
-                 SSTable compaction progress from the beta protocol, which cannot \
-                 be validated. Drain or reset the table first.",
-            ));
-        }
-
-        // Beta coverage was written under rules this protocol does not enforce,
-        // so it is not trustworthy. Left in place, a later compaction would find it
-        // already satisfied and could retire an SSTable that no index covers.
-        if details.index_catchup.is_empty() {
-            return Ok(());
-        }
-        details.index_catchup.clear();
-        final_indices[pos] = new_mem_wal_index_meta(new_version, details)?;
-        Ok(())
     }
 
     /// Every non-system logical index, mapped to what determines its coverage.
@@ -1945,21 +1868,12 @@ impl Transaction {
     /// an ordinary reindex that fully covers no longer has to throw its work
     /// away and wait for a repair.
     ///
-    /// Only meaningful once catch-up is required, where a missing entry means
-    /// "not caught up" and the SSTables stay. A legacy table reads a missing
-    /// entry as "fully caught up", so this leaves it untouched rather than
-    /// making the table look more covered than it is.
     fn apply_mem_wal_index_coverage(
         final_indices: &mut [IndexMetadata],
         segments_before: &LogicalIndexSegments,
         read_version_state: Option<ReadVersionState<'_>>,
-        index_catchup_required: bool,
         new_version: u64,
     ) -> Result<()> {
-        if !index_catchup_required {
-            return Ok(());
-        }
-
         let Some(pos) = final_indices
             .iter()
             .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -2263,24 +2177,14 @@ impl Transaction {
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
-        // Both words must agree: a reader that keeps legacy semantics would read a
-        // missing entry as "fully caught up", so a half-set state is not safe mode.
-        let index_catchup_required = current_manifest
-            .map(|m| {
-                m.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
-                    && m.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0
-            })
-            .unwrap_or(false);
-
         // Snapshot taken before the operation rewrites the list, so coverage can
         // be compared against what each logical index looked like going in. Only
-        // tables in safe mode maintain coverage, so every other commit -- and the
-        // segment clones this costs -- pays nothing.
-        let mem_wal_segments_before = (index_catchup_required
-            && final_indices
-                .iter()
-                .any(|idx| idx.name == MEM_WAL_INDEX_NAME))
-        .then(|| Self::logical_index_segments(&final_indices));
+        // tables with a MemWAL index maintain coverage, so every other commit --
+        // and the segment clones this costs -- pays nothing.
+        let mem_wal_segments_before = final_indices
+            .iter()
+            .any(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .then(|| Self::logical_index_segments(&final_indices));
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
@@ -2896,7 +2800,6 @@ impl Transaction {
                 &mut final_indices,
                 mem_wal_segments_before.as_ref().unwrap_or(&empty_segments),
                 read_version_state,
-                index_catchup_required,
                 new_version,
             )?;
         }
@@ -2944,50 +2847,6 @@ impl Transaction {
                 use_stable_row_ids,
                 config.disable_transaction_file,
             )?;
-        }
-        // Carried from the manifest this one is derived from. `new_from_previous`
-        // zeroes both feature words, so `apply_feature_flags` cannot see the
-        // previous state and every ordinary commit would otherwise drop the bit.
-        if let Some(current_manifest) = current_manifest {
-            inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
-        }
-
-        // Set after apply_feature_flags, which resets both flag words: activation
-        // is the one place the bit is turned on, and it must survive that reset.
-        if let Operation::UpdateMemWalState {
-            require_index_catchup: true,
-            ..
-        } = &self.operation
-        {
-            let reader_set = current_manifest
-                .map(|m| m.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0)
-                .unwrap_or(false);
-            let writer_set = current_manifest
-                .map(|m| m.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP != 0)
-                .unwrap_or(false);
-            match (reader_set, writer_set) {
-                (false, false) => {
-                    Self::require_index_catchup(&mut final_indices, new_version)?;
-                    log::info!(
-                        "MemWAL index catch-up is now required at version {new_version}; a \
-                         missing catch-up entry means an index is behind, not caught up. \
-                         This is one-way."
-                    );
-                }
-                // Already active. A retry whose first attempt landed but lost its
-                // response must not clear coverage repaired since, so this keeps
-                // every recorded generation.
-                (true, true) => {}
-                _ => {
-                    return Err(Error::invalid_input(
-                        "Cannot require MemWAL index catch-up: the table has only one of \
-                         the reader and writer feature bits set, so its catch-up \
-                         semantics are undefined",
-                    ));
-                }
-            }
-            manifest.reader_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
-            manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
         }
 
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -4063,27 +3922,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState {
-                    compacted_sstables,
-                    require_index_catchup,
-                },
+                pb::transaction::UpdateMemWalState { compacted_sstables },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
-                // Absent is an ordinary progress update. Explicit `false` is
-                // refused rather than read as absent, so a caller cannot express
-                // "deactivate" -- the migration is one-way.
-                require_index_catchup: match require_index_catchup {
-                    Some(false) => {
-                        return Err(Error::invalid_input(
-                            "require_index_catchup cannot be false: MemWAL index catch-up \
-                             cannot stop being required once it is",
-                        ));
-                    }
-                    other => other.unwrap_or(false),
-                },
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -4376,18 +4220,12 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState {
-                compacted_sstables,
-                require_index_catchup,
-            } => {
+            Operation::UpdateMemWalState { compacted_sstables } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
-                    // Written only when requesting activation, so an ordinary
-                    // progress update stays byte-identical to before.
-                    require_index_catchup: require_index_catchup.then_some(true),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -4689,7 +4527,6 @@ mod tests {
         use lance_index::mem_wal::{
             CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
         };
-        use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 
         fn user_index(name: &str, uuid: Uuid, frags: &[u32]) -> IndexMetadata {
             IndexMetadata {
@@ -4746,7 +4583,6 @@ mod tests {
             before: &[IndexMetadata],
             read_frags: &[u32],
             read_indices: &[IndexMetadata],
-            required: bool,
         ) -> Result<()> {
             let manifest = manifest_with(read_frags);
             let segments_before = Transaction::logical_index_segments(before);
@@ -4757,7 +4593,6 @@ mod tests {
                     manifest: &manifest,
                     indices: read_indices,
                 }),
-                required,
                 2,
             )
         }
@@ -4791,7 +4626,7 @@ mod tests {
             let shard = Uuid::new_v4();
             let read = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
             let mut after = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
-            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut after, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
 
@@ -4802,7 +4637,7 @@ mod tests {
             let shard = Uuid::new_v4();
             let read = table(&[0], Uuid::new_v4(), progress(shard, 5));
             let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
-            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut after, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
@@ -4820,7 +4655,7 @@ mod tests {
             let before = table(&[0, 1], uuid, progress_with_catchup(shard, 5, 5));
             // Same UUID, fragment 1 pruned away.
             let mut after = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
-            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            apply(&mut after, &before, &[0, 1], &before).unwrap();
             assert_eq!(
                 coverage_for(&after, "idx"),
                 None,
@@ -4840,7 +4675,7 @@ mod tests {
             let before = table(&[0], uuid, progress_with_catchup(shard, 5, 2));
             let mut after = before.clone();
             // Fragment 1 arrived with that compaction and this index lacks it.
-            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            apply(&mut after, &before, &[0, 1], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 2)));
         }
 
@@ -4853,7 +4688,7 @@ mod tests {
             let uuid = Uuid::new_v4();
             let before = table(&[0], uuid, progress_with_catchup(shard, 3, 9));
             let mut after = before.clone();
-            apply(&mut after, &before, &[0], &before, true).unwrap();
+            apply(&mut after, &before, &[0], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 3)));
         }
 
@@ -4865,7 +4700,7 @@ mod tests {
             let uuid = Uuid::new_v4();
             let before = table(&[0], uuid, progress_with_catchup(shard, 9, 9));
             let mut after = before.clone();
-            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            apply(&mut after, &before, &[0, 1], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 9)));
         }
 
@@ -4877,7 +4712,7 @@ mod tests {
             let shard = Uuid::new_v4();
             let read = table(&[0], Uuid::new_v4(), progress(shard, 9));
             let mut after = table(&[0], Uuid::new_v4(), progress(shard, 3));
-            apply(&mut after, &read, &[0], &read, true).unwrap();
+            apply(&mut after, &read, &[0], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 3)));
         }
 
@@ -4891,7 +4726,7 @@ mod tests {
             // Read at generation 2; generation 5 landed while this ran.
             let read = table(&[0], Uuid::new_v4(), progress(shard, 2));
             let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
-            apply(&mut after, &read, &[0], &read, true).unwrap();
+            apply(&mut after, &read, &[0], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 2)));
         }
 
@@ -4909,7 +4744,7 @@ mod tests {
                 mem_wal_index(progress(shard, 5)),
             ];
             let mut after = read.clone();
-            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut after, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
@@ -4919,7 +4754,7 @@ mod tests {
             let shard = Uuid::new_v4();
             let before = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
             let mut after = vec![mem_wal_index(progress_with_catchup(shard, 5, 5))];
-            apply(&mut after, &before, &[0], &before, true).unwrap();
+            apply(&mut after, &before, &[0], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
@@ -4933,20 +4768,20 @@ mod tests {
             let before = vec![mem_wal_index(progress(shard, 5))];
             let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
             // Covers the read version, but was not there when it was read.
-            apply(&mut after, &before, &[0], &before, true).unwrap();
+            apply(&mut after, &before, &[0], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
 
-        /// A legacy table reads a missing entry as "fully caught up", so this
-        /// must leave it alone rather than make it look more covered.
+        /// A table carrying compaction progress but no catch-up entry earns one
+        /// from an ordinary commit. This is how a table written before catch-up
+        /// was maintained heals itself: nothing has to be run against it.
         #[test]
-        fn a_legacy_table_is_untouched() {
+        fn a_table_with_no_catchup_entry_earns_one() {
             let shard = Uuid::new_v4();
             let before = table(&[0], Uuid::new_v4(), progress(shard, 5));
             let mut after = before.clone();
-            let untouched = after.clone();
-            apply(&mut after, &before, &[0], &before, false).unwrap();
-            assert_eq!(after, untouched);
+            apply(&mut after, &before, &[0], &before).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
 
         /// Two shards, only one of them compacted.
@@ -4963,7 +4798,7 @@ mod tests {
             };
             let read = table(&[0], Uuid::new_v4(), details.clone());
             let mut after = table(&[0], Uuid::new_v4(), details);
-            apply(&mut after, &read, &[0], &read, true).unwrap();
+            apply(&mut after, &read, &[0], &read).unwrap();
             let coverage = coverage_for(&after, "idx").expect("credited");
             assert_eq!(
                 coverage
@@ -4991,7 +4826,7 @@ mod tests {
                 mem_wal_index(progress(shard, 6)),
             ];
             let mut after = read.clone();
-            apply(&mut after, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut after, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&after, "fast"), Some(compacted(shard, 6)));
             assert_eq!(coverage_for(&after, "slow"), None);
         }
@@ -5004,7 +4839,7 @@ mod tests {
             idx.fragment_bitmap = None;
             let read = vec![idx, mem_wal_index(progress(shard, 5))];
             let mut after = read.clone();
-            apply(&mut after, &read, &[0], &read, true).unwrap();
+            apply(&mut after, &read, &[0], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
@@ -5014,7 +4849,7 @@ mod tests {
             let before = table(&[0], Uuid::new_v4(), MemWalIndexDetails::default());
             let mut after = before.clone();
             let untouched = after.clone();
-            apply(&mut after, &before, &[0], &before, true).unwrap();
+            apply(&mut after, &before, &[0], &before).unwrap();
             assert_eq!(after, untouched);
         }
 
@@ -5024,7 +4859,7 @@ mod tests {
             let before = vec![user_index("idx", Uuid::new_v4(), &[0])];
             let mut after = before.clone();
             let untouched = after.clone();
-            apply(&mut after, &before, &[0], &before, true).unwrap();
+            apply(&mut after, &before, &[0], &before).unwrap();
             assert_eq!(after, untouched);
         }
 
@@ -5037,7 +4872,7 @@ mod tests {
             let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
             let mut after = before.clone();
             let segments_before = Transaction::logical_index_segments(&before);
-            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, true, 2)
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, 2)
                 .unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
@@ -5053,7 +4888,7 @@ mod tests {
                 mem_wal_index(progress(shard, 10)),
             ];
             let mut after = read.clone();
-            apply(&mut after, &read, &[0], &read, true).unwrap();
+            apply(&mut after, &read, &[0], &read).unwrap();
             assert_eq!(coverage_for(&after, "untrained"), None);
             assert_eq!(coverage_for(&after, "trained"), Some(compacted(shard, 10)));
         }
@@ -5085,7 +4920,7 @@ mod tests {
                 }),
             ];
             let mut after = vec![user_index("idx", uuid, &[0]), mem_wal_index(details(10))];
-            apply(&mut after, &read, &[0], &read, true).unwrap();
+            apply(&mut after, &read, &[0], &read).unwrap();
 
             let mut coverage = coverage_for(&after, "idx").expect("credited");
             coverage.sort_unstable_by_key(|sstable| sstable.shard_id);
@@ -5106,7 +4941,7 @@ mod tests {
             let before = table(&[0, 1], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
             // Rebuilt over a subset -- the shape a partial reindex leaves.
             let mut after = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
-            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            apply(&mut after, &before, &[0, 1], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
@@ -5120,7 +4955,7 @@ mod tests {
             let before = table(&[0], uuid, progress_with_catchup(shard, 5, 0));
             let mut after = before.clone();
             // Does not span the read version, so nothing lifts it off zero.
-            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            apply(&mut after, &before, &[0, 1], &before).unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
@@ -5147,7 +4982,7 @@ mod tests {
             let before = vec![user_index("idx", uuid, &[0]), mem_wal_index(details)];
             let mut after = before.clone();
             // Unchanged and unproven: both shards keep exactly what they had.
-            apply(&mut after, &before, &[0, 1], &before, true).unwrap();
+            apply(&mut after, &before, &[0, 1], &before).unwrap();
 
             let mut coverage = coverage_for(&after, "idx").expect("carried");
             coverage.sort_unstable_by_key(|sstable| sstable.shard_id);
@@ -5167,7 +5002,7 @@ mod tests {
             let uuid = Uuid::new_v4();
             let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
             let mut after = before.clone();
-            apply(&mut after, &before, &[0], &before, true).unwrap();
+            apply(&mut after, &before, &[0], &before).unwrap();
 
             let system_uuid = |indices: &[IndexMetadata]| {
                 indices
@@ -5178,54 +5013,6 @@ mod tests {
             };
             assert_eq!(system_uuid(&after), system_uuid(&before));
         }
-
-        /// Activation is what puts a table on the protocol. A table that has
-        /// never compacted is clean.
-        #[test]
-        fn activation_accepts_a_clean_table() {
-            let mut indices = vec![mem_wal_index(MemWalIndexDetails::default())];
-            Transaction::require_index_catchup(&mut indices, 2).unwrap();
-        }
-
-        /// There is nothing to put on the protocol.
-        #[test]
-        fn activation_requires_the_mem_wal_index() {
-            let err = Transaction::require_index_catchup(&mut [], 2).unwrap_err();
-            assert!(err.to_string().contains("does not exist"), "{err}");
-        }
-
-        /// Coverage recorded under the beta rules was written to a different
-        /// contract; keeping it would let the first trim run unchecked.
-        #[test]
-        fn activation_clears_beta_coverage() {
-            let shard = Uuid::new_v4();
-            let mut indices = vec![mem_wal_index(MemWalIndexDetails {
-                index_catchup: vec![IndexCatchupProgress::new(
-                    "idx".to_string(),
-                    compacted(shard, 100),
-                )],
-                ..Default::default()
-            })];
-
-            Transaction::require_index_catchup(&mut indices, 2).unwrap();
-
-            assert!(
-                load_mem_wal_index_details(indices[0].clone())
-                    .unwrap()
-                    .index_catchup
-                    .is_empty()
-            );
-        }
-
-        /// Beta compaction progress means SSTables were folded in without any
-        /// coverage rule. No later commit can prove which indexes hold them.
-        #[test]
-        fn activation_rejects_pre_existing_beta_compaction_progress() {
-            let mut indices = vec![mem_wal_index(progress(Uuid::new_v4(), 4))];
-            let err = Transaction::require_index_catchup(&mut indices, 2).unwrap_err();
-            assert!(err.to_string().contains("beta protocol"), "{err}");
-        }
-
         fn config_transaction(current: &Manifest) -> Transaction {
             Transaction::new(
                 current.version,
@@ -5238,54 +5025,6 @@ mod tests {
                 None,
             )
         }
-
-        /// One bit without the other is a manifest no writer should produce:
-        /// a reader-only bit lets an unaware writer trim, a writer-only bit
-        /// lets an unaware reader serve rows no index holds.
-        #[test]
-        fn a_half_set_feature_bit_is_refused() {
-            for (reader, writer) in [
-                (FLAG_MEM_WAL_INDEX_CATCHUP, 0),
-                (0, FLAG_MEM_WAL_INDEX_CATCHUP),
-            ] {
-                let mut current = sample_manifest_with_fragments(0..1);
-                current.reader_feature_flags = reader;
-                current.writer_feature_flags = writer;
-
-                let err = config_transaction(&current)
-                    .build_manifest(
-                        Some(&current),
-                        vec![mem_wal_index(MemWalIndexDetails::default())],
-                        "txn",
-                        &ManifestWriteConfig::default(),
-                    )
-                    .unwrap_err();
-
-                assert!(err.to_string().contains("only one of"), "{err}");
-            }
-        }
-
-        /// A writer that knows nothing about catch-up must not silently take a
-        /// table off the protocol.
-        #[test]
-        fn an_ordinary_commit_keeps_the_feature_bit() {
-            let mut current = sample_manifest_with_fragments(0..1);
-            current.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-            current.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
-
-            let (next, _) = config_transaction(&current)
-                .build_manifest(
-                    Some(&current),
-                    vec![mem_wal_index(MemWalIndexDetails::default())],
-                    "txn",
-                    &ManifestWriteConfig::default(),
-                )
-                .unwrap();
-
-            assert_ne!(next.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
-            assert_ne!(next.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP, 0);
-        }
-
         /// Two attempts against the same read version agree, which is what makes
         /// a rebase safe: `read_version` is fixed for a transaction's life.
         #[test]
@@ -5294,8 +5033,8 @@ mod tests {
             let read = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
             let mut first = table(&[0, 1], Uuid::new_v4(), progress(shard, 5));
             let mut second = first.clone();
-            apply(&mut first, &read, &[0, 1], &read, true).unwrap();
-            apply(&mut second, &read, &[0, 1], &read, true).unwrap();
+            apply(&mut first, &read, &[0, 1], &read).unwrap();
+            apply(&mut second, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&first, "idx"), coverage_for(&second, "idx"));
         }
     }

@@ -55,7 +55,6 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -1296,14 +1295,8 @@ impl IndexDescription for IndexDescriptionImpl {
 
 impl Dataset {
     /// Whether a commit on this table could record a new MemWAL catch-up
-    /// position: it is on the protocol, and something has been compacted for an
-    /// index to be behind on.
+    /// position: something has been compacted for an index to be behind on.
     async fn mem_wal_catch_up_may_advance(&self) -> Result<bool> {
-        if self.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
-            || self.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP == 0
-        {
-            return Ok(false);
-        }
         let Some(system_index) = self
             .load_indices()
             .await?
