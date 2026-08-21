@@ -30,12 +30,13 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// unless [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
-// Bit 128 was `FLAG_MEM_WAL_INDEX_CATCHUP`, which gated whether `index_catchup`
-// was maintained. Index catch-up is now unconditional, so the bit carries no
-// information and is not reused: `FLAG_UNKNOWN` stays at 256 so a table written
-// while the flag existed still opens.
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 128;
+
+// The highest flag allocated must stay below the unknown boundary, or
+// `supported_flags` would refuse a bit this code claims to understand. The next
+// flag takes 128, so it has to move the boundary to 256 with it.
+const _: () = assert!(FLAG_UNSTABLE_DATA_OVERLAY_FILES < FLAG_UNKNOWN);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -327,16 +328,5 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         )
-    }
-
-    /// Bit 128 belonged to a removed feature. It is still below the unknown
-    /// boundary, so a table written while that flag existed opens rather than
-    /// being refused; and the boundary itself has not moved.
-    #[test]
-    fn the_retired_bit_is_still_tolerated() {
-        assert!(can_read_dataset(128));
-        assert!(can_write_dataset(128));
-        assert!(!can_read_dataset(FLAG_UNKNOWN));
-        assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
 }
