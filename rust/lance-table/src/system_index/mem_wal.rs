@@ -33,6 +33,35 @@ pub type ShardId = Uuid;
 pub struct SsTable {
     pub generation: u64,
     pub path: String,
+    /// Decoded size of the rows this SSTable holds, measured on the memtable it
+    /// was flushed from.
+    ///
+    /// Stored rather than derived from the files: those are encoded, so their
+    /// size understates this by whatever the columns compressed by, and getting
+    /// it off the data means decoding the generation.
+    ///
+    /// `None` on SSTables flushed before the field existed, which a reader has
+    /// to carry as unmeasured rather than as zero.
+    pub in_memory_bytes: Option<u64>,
+    /// Rows this SSTable holds, including the older duplicates its deletion
+    /// vector masks -- the same sense as `DataFragment::physical_rows`.
+    ///
+    /// Counting the masked duplicates keeps it an over-estimate of what a
+    /// deduped scan yields, never an under-estimate. `None` for the same reason
+    /// as [`Self::in_memory_bytes`].
+    pub physical_rows: Option<u64>,
+}
+
+impl SsTable {
+    /// An SSTable whose contents were not measured at flush.
+    pub fn unmeasured(generation: u64, path: String) -> Self {
+        Self {
+            generation,
+            path,
+            in_memory_bytes: None,
+            physical_rows: None,
+        }
+    }
 }
 
 impl From<&SsTable> for pb::SsTable {
@@ -40,6 +69,8 @@ impl From<&SsTable> for pb::SsTable {
         Self {
             generation: sstable.generation,
             path: sstable.path.clone(),
+            in_memory_bytes: sstable.in_memory_bytes,
+            physical_rows: sstable.physical_rows,
         }
     }
 }
@@ -49,6 +80,8 @@ impl From<pb::SsTable> for SsTable {
         Self {
             generation: sstable.generation,
             path: sstable.path,
+            in_memory_bytes: sstable.in_memory_bytes,
+            physical_rows: sstable.physical_rows,
         }
     }
 }
@@ -574,4 +607,42 @@ pub fn new_mem_wal_index_meta(
         // Memory WAL index is inline (no files)
         files: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An SSTable written before the size fields existed decodes as
+    /// unmeasured, not as zero. A reader that saw zero would treat a full
+    /// generation as costing nothing.
+    #[test]
+    fn an_sstable_without_the_size_fields_decodes_as_unmeasured() {
+        let legacy = pb::SsTable {
+            generation: 7,
+            path: "aaa_gen_7".to_string(),
+            in_memory_bytes: None,
+            physical_rows: None,
+        };
+        let decoded = SsTable::from(legacy);
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.in_memory_bytes, None);
+        assert_eq!(decoded.physical_rows, None);
+    }
+
+    /// Both numbers survive the round trip, so a reader sees what the flush
+    /// measured rather than a default.
+    #[test]
+    fn the_recorded_size_survives_the_round_trip() {
+        let recorded = SsTable {
+            generation: 7,
+            path: "aaa_gen_7".to_string(),
+            in_memory_bytes: Some(4_096),
+            physical_rows: Some(10),
+        };
+        let encoded = pb::SsTable::from(&recorded);
+        assert_eq!(encoded.in_memory_bytes, Some(4_096));
+        assert_eq!(encoded.physical_rows, Some(10));
+        assert_eq!(SsTable::from(encoded), recorded);
+    }
 }

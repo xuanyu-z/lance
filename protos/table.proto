@@ -709,6 +709,28 @@ message SsTable {
 
   // Directory name relative to the shard directory.
   string path = 2;
+
+  // Decoded size of the rows this SSTable holds, measured on the memtable it
+  // was flushed from.
+  //
+  // Stored rather than derived from the files: those are encoded, so their
+  // size understates this by whatever the columns compressed by, and getting
+  // it off the data means decoding the generation. It covers every row
+  // written, so a read that applies the generation's deletion vector
+  // materializes less.
+  //
+  // Absent on SSTables flushed before this field existed.
+  optional uint64 in_memory_bytes = 3;
+
+  // Rows this SSTable holds, including the older duplicates its deletion
+  // vector masks -- the same sense as `DataFragment.physical_rows`.
+  //
+  // Stored for the same reason as the size above. Counting the masked
+  // duplicates keeps it an over-estimate of what a deduped scan yields, never
+  // an under-estimate.
+  //
+  // Absent on SSTables flushed before this field existed.
+  optional uint64 physical_rows = 4;
 }
 
 // A pointer to the latest SSTable compacted for a shard.
