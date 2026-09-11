@@ -92,6 +92,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     };
 
     let mut target_partition_size = 0u64;
+    let mut target_num_partitions = None;
     let mut hnsw_index_config = None;
     let mut compression = None;
     let mut runtime_hints: HashMap<String, String> = params.runtime_hints.clone();
@@ -102,16 +103,11 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
                 if let Some(tps) = ivf.target_partition_size {
                     target_partition_size = tps as u64;
                 }
-                // The requested partition count is what a rebuild has to start
+                // The requested partition count is what a rebuild starts
                 // from: a definition created for a table too small to train
-                // must come back at the count it asked for once the table
-                // grows, and re-derive the cap from the data it then has.
-                if let Some(num_partitions) = ivf.num_partitions {
-                    runtime_hints.insert(
-                        "lance.ivf.num_partitions".to_string(),
-                        num_partitions.to_string(),
-                    );
-                }
+                // comes back at the count it asked for once the table grows,
+                // and re-derives the cap from the data it then has.
+                target_num_partitions = ivf.num_partitions.map(|n| n as u32);
                 runtime_hints.insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
                 runtime_hints.insert(
                     "lance.ivf.sample_rate".to_string(),
@@ -172,7 +168,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
-        target_num_partitions: None,
+        target_num_partitions,
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -202,9 +198,6 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
     for stage in &mut params.stages {
         match stage {
             StageParams::Ivf(ivf) => {
-                if let Some(v) = parse(hints, "lance.ivf.num_partitions") {
-                    ivf.num_partitions = Some(v);
-                }
                 if let Some(v) = parse(hints, "lance.ivf.max_iters") {
                     ivf.max_iters = v;
                 }
@@ -273,6 +266,7 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
     if d.target_partition_size > 0 {
         ivf.target_partition_size = Some(d.target_partition_size as usize);
     }
+    ivf.num_partitions = d.target_num_partitions.map(|n| n as usize);
 
     let hnsw = d.hnsw_index_config.map(|h| HnswBuildParams {
         m: h.max_connections as usize,
@@ -1146,7 +1140,6 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             IvfBuildParams {
-                num_partitions: Some(12),
                 max_iters: 100,
                 sample_rate: 512,
                 shuffle_partition_batches: 2048,
@@ -1165,13 +1158,6 @@ mod tests {
 
         let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
-        assert_eq!(
-            details
-                .runtime_hints
-                .get("lance.ivf.num_partitions")
-                .map(|s| s.as_str()),
-            Some("12")
-        );
         assert_eq!(
             details
                 .runtime_hints
@@ -1247,7 +1233,6 @@ mod tests {
         let StageParams::Ivf(ivf) = &restored.stages[0] else {
             panic!()
         };
-        assert_eq!(ivf.num_partitions, Some(12));
         assert_eq!(ivf.max_iters, 100);
         assert_eq!(ivf.sample_rate, 512);
         assert_eq!(ivf.shuffle_partition_batches, 2048);
@@ -1258,22 +1243,51 @@ mod tests {
         assert_eq!(pq.max_iters, 75);
         assert_eq!(pq.sample_rate, 128);
         assert_eq!(pq.kmeans_redos, 3);
+    }
 
-        // An auto-sized build records no count, so restoring leaves the
-        // partition count to be derived from the data again.
+    /// The requested partition count rides in its own field, and an auto-sized
+    /// build records none so a rebuild derives the partitioning again.
+    #[test]
+    fn test_target_num_partitions_roundtrip() {
+        use crate::index::vector::{StageParams, VectorIndexParams};
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        let requested = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                num_partitions: Some(12),
+                ..Default::default()
+            },
+            PQBuildParams::default(),
+        );
+        let any = vector_index_details(&requested);
+        let details = any.to_msg::<VectorIndexDetails>().unwrap();
+        assert_eq!(details.target_num_partitions, Some(12));
+        let restored = vector_params_from_details(&any).unwrap();
+        let StageParams::Ivf(ivf) = &restored.stages[0] else {
+            panic!("first stage should be IVF")
+        };
+        assert_eq!(ivf.num_partitions, Some(12));
+
         let auto_sized = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             IvfBuildParams::default(),
             PQBuildParams::default(),
         );
-        let auto_details = vector_index_details(&auto_sized)
-            .to_msg::<VectorIndexDetails>()
-            .unwrap();
-        assert!(
-            !auto_details
-                .runtime_hints
-                .contains_key("lance.ivf.num_partitions")
+        let any = vector_index_details(&auto_sized);
+        assert_eq!(
+            any.to_msg::<VectorIndexDetails>()
+                .unwrap()
+                .target_num_partitions,
+            None
         );
+        let restored = vector_params_from_details(&any).unwrap();
+        let StageParams::Ivf(ivf) = &restored.stages[0] else {
+            panic!("first stage should be IVF")
+        };
+        assert_eq!(ivf.num_partitions, None);
     }
 
     #[test]
