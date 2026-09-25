@@ -1096,7 +1096,7 @@ fn build_training_batch(
 }
 
 /// Configuration for a BTree scalar index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BTreeIndexConfig {
     /// Index name.
     pub name: String,
