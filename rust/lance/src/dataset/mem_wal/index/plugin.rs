@@ -222,6 +222,17 @@ impl ResolveContext<'_> {
             ))
         })
     }
+
+    /// Refuse writer settings, for a plugin that reads none.
+    pub fn reject_overrides(&self) -> Result<()> {
+        match self.overrides {
+            None => Ok(()),
+            Some(_) => Err(Error::invalid_input(format!(
+                "index '{}' was given writer settings, but its plugin reads none",
+                self.name
+            ))),
+        }
+    }
 }
 
 /// What a plugin resolved about one index against the base table.
@@ -585,13 +596,12 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
         None
     }
 
-    /// Resolve this index against the base table: which columns it really
-    /// covers, and whatever it needs to build one.
-    ///
-    /// Runs once, when a memtable is configured, so the per-memtable
-    /// [`create`](Self::create) stays synchronous and cannot do I/O on the
-    /// write path. A kind with nothing to resolve does not implement this.
+    /// Resolve this index against the base table: the columns it covers and
+    /// what it needs to build one. Runs once per writer, so
+    /// [`create`](Self::create) does no I/O. The default reads no writer
+    /// settings and refuses any.
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
+        ctx.reject_overrides()?;
         Ok(ResolvedIndex::plain(ctx.columns.to_vec()))
     }
 

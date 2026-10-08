@@ -6406,7 +6406,6 @@ mod tests {
         filter: Option<&str>,
     ) -> Vec<i32> {
         use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
-        use futures::TryStreamExt;
 
         let manifest = writer.manifest().await.unwrap().unwrap();
         let mut snapshot =
@@ -6414,12 +6413,42 @@ mod tests {
         for sstable in &manifest.sstables {
             snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
-        let mut scanner = LsmScanner::without_base_table(
+        let scanner = LsmScanner::without_base_table(
             schema,
             base_uri.to_string(),
             vec![snapshot],
             vec!["id".to_string()],
         );
+        scan_ids(scanner, filter).await
+    }
+
+    /// The ids a read of the writer's in-memory memtables returns.
+    async fn read_memtable_ids_via_lsm(
+        writer: &ShardWriter,
+        schema: Arc<ArrowSchema>,
+        base_uri: &str,
+        shard_id: Uuid,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema,
+            base_uri.to_string(),
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        scan_ids(scanner, filter).await
+    }
+
+    async fn scan_ids(
+        mut scanner: crate::dataset::mem_wal::scanner::LsmScanner,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use futures::TryStreamExt;
+
         if let Some(predicate) = filter {
             scanner = scanner.filter(predicate).unwrap();
         }
@@ -6496,6 +6525,79 @@ mod tests {
             "filtered read after flush must not resurface deleted id=2"
         );
 
+        writer.close().await.unwrap();
+    }
+
+    /// A user index may carry any name, including one shaped like an internal
+    /// key index. It keeps its own column through writes, overwrites, deletes,
+    /// a flush and a reopen, and the key index keeps deduplicating beside it.
+    #[tokio::test]
+    async fn test_user_index_named_like_a_key_index_keeps_its_column() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let index_specs = vec![MemIndexSpec::btree("__pk__id", 1, "name")];
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                flush_test_config(shard_id),
+                schema.clone(),
+                index_specs.clone(),
+            )
+        };
+        let renamed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["renamed"])),
+            ],
+        )
+        .unwrap();
+        let cases = [
+            ("name = 'renamed'", vec![1]),
+            ("name = 'name_1'", vec![]),
+            ("name = 'name_2'", vec![]),
+            ("name = 'name_3'", vec![3]),
+            ("id = 1", vec![1]),
+            ("id = 2", vec![]),
+        ];
+
+        let writer = open().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.put(vec![renamed]).await.unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+        for (filter, expected) in &cases {
+            let ids = read_memtable_ids_via_lsm(
+                &writer,
+                schema.clone(),
+                &base_uri,
+                shard_id,
+                Some(filter),
+            )
+            .await;
+            assert_eq!(&ids, expected, "fresh read of {filter}");
+        }
+
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        writer.close().await.unwrap();
+        let writer = open().await.unwrap();
+        for (filter, expected) in &cases {
+            let ids = read_sstable_ids_via_lsm(
+                &writer,
+                schema.clone(),
+                &base_uri,
+                shard_id,
+                Some(filter),
+            )
+            .await;
+            assert_eq!(&ids, expected, "flushed read of {filter}");
+        }
         writer.close().await.unwrap();
     }
 

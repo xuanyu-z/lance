@@ -88,18 +88,20 @@ const PK_KEY_COLUMN: &str = "__pk_key__";
 const PARALLEL_INDEX_MIN_ROWS: usize = 64;
 
 /// The memtable's primary-key index, used to answer "newest visible version of
-/// this key" for dedup. Single-column PKs reuse the column's compact typed
-/// [`BTreeMemIndex`] (no second copy); composite PKs key a `BTreeMemIndex` on
-/// the order-preserving encoded tuple ([`encode_pk_tuple`]) instead. Either way
-/// the lookup is a single seek on one `BTreeMemIndex`.
+/// this key" for dedup. A single-column PK seeks one index on the column;
+/// a composite PK keys a `BTreeMemIndex` on the order-preserving encoded tuple
+/// ([`encode_pk_tuple`]).
 enum PkIndex {
-    /// Arity 1: aliases the entry named `entry` in `indexes`, so the insert
-    /// loop maintains it. Held by name because a plugin may hand out a fresh
-    /// capability wrapper each time it is asked.
-    Single {
+    /// Arity 1, a user index on exactly the key column: the entry named
+    /// `entry` in `indexes`, which the insert loop maintains. Held by name,
+    /// since a plugin may hand out a fresh capability wrapper each time.
+    Shared {
         index: Arc<dyn PrimaryKeyIndex>,
         entry: String,
     },
+    /// Arity 1, the memtable's own B-tree. Held apart from `indexes`, so no
+    /// user index name can collide with it, and maintained in the insert paths.
+    Owned(Arc<BTreeMemIndex>),
     /// Arity >= 2: an index over the encoded-tuple `Binary` key, maintained
     /// explicitly in the insert paths (the original batch lacks the synthetic
     /// key column). `columns` are the PK columns in order, resolved against
@@ -108,6 +110,15 @@ enum PkIndex {
         index: Arc<dyn PrimaryKeyIndex>,
         columns: Vec<String>,
     },
+}
+
+impl PkIndex {
+    fn index(&self) -> &dyn PrimaryKeyIndex {
+        match self {
+            Self::Shared { index, .. } | Self::Composite { index, .. } => index.as_ref(),
+            Self::Owned(index) => index.as_ref(),
+        }
+    }
 }
 
 // ============================================================================
@@ -329,8 +340,8 @@ impl std::fmt::Debug for IndexStore {
                 "pk_index",
                 &match &self.pk_index {
                     None => "none".to_string(),
-                    Some(PkIndex::Single { index, .. }) => {
-                        format!("single({})", index.columns().join(", "))
+                    Some(pk @ (PkIndex::Shared { .. } | PkIndex::Owned(_))) => {
+                        format!("single({})", pk.index().columns().join(", "))
                     }
                     Some(PkIndex::Composite { columns, .. }) => {
                         format!("composite({})", columns.join(", "))
@@ -492,9 +503,8 @@ impl IndexStore {
     /// Maintain a primary-key index so the memtable can answer "newest visible
     /// version of this key" (see [`Self::pk_newest_visible`]).
     ///
-    /// Single-column PKs reuse an existing BTree on the field, else auto-create
-    /// one under a `__pk__*` name so the normal insert loop maintains it (no
-    /// second copy). Composite (arity >= 2) PKs key a `BTreeMemIndex` on the
+    /// A single-column PK shares a user index on the key column that can serve
+    /// as one, else keeps its own B-tree. Composite (arity >= 2) PKs key a `BTreeMemIndex` on the
     /// order-preserving encoded tuple (synthetic `PK_KEY_COLUMN`), maintained
     /// explicitly in the insert paths. Call once at construction, after
     /// [`Self::from_specs`] and before any inserts; a no-op when `pk_columns`
@@ -521,16 +531,10 @@ impl IndexStore {
                     .find_map(|(name, index)| {
                         index.clone().as_primary_key().map(|pk| (name.clone(), pk))
                     });
-                let (entry, index) = match existing {
-                    Some(shared) => shared,
-                    None => {
-                        let entry = format!("__pk__{column}");
-                        let btree = Arc::new(BTreeMemIndex::new(*field_id, column.clone()));
-                        self.indexes.insert(entry.clone(), btree.clone());
-                        (entry, btree as Arc<dyn PrimaryKeyIndex>)
-                    }
-                };
-                Some(PkIndex::Single { index, entry })
+                Some(match existing {
+                    Some((entry, index)) => PkIndex::Shared { index, entry },
+                    None => PkIndex::Owned(Arc::new(BTreeMemIndex::new(*field_id, column.clone()))),
+                })
             }
             multi => Some(PkIndex::Composite {
                 // Synthetic field id (-1): the composite index is held directly,
@@ -554,9 +558,7 @@ impl IndexStore {
     pub fn pk_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
         match &self.pk_index {
             None => Ok(Vec::new()),
-            Some(PkIndex::Single { index, .. }) | Some(PkIndex::Composite { index, .. }) => {
-                index.training_batches(batch_size)
-            }
+            Some(pk) => pk.index().training_batches(batch_size),
         }
     }
 
@@ -576,30 +578,35 @@ impl IndexStore {
             .collect()
     }
 
-    /// Maintain the composite PK index for `batch` (no-op for single/no PK):
-    /// encode the PK columns into the synthetic `PK_KEY_COLUMN` `Binary` column
-    /// and feed that to the keyed `BTreeMemIndex`.
-    fn insert_composite_pk(
+    /// Maintain the primary-key index this store owns, if any, for `batch`: the
+    /// single-column B-tree directly, the composite one over the encoded
+    /// `PK_KEY_COLUMN`. A shared key index is maintained with the user indexes.
+    fn insert_owned_pk(
         &self,
         batch: &RecordBatch,
         row_offset: u64,
         report_existing: bool,
     ) -> Result<bool> {
-        if let Some(PkIndex::Composite { index, columns }) = &self.pk_index {
-            let pk_indices = Self::pk_batch_indices(batch, columns)?;
-            let encoded = encode_pk_batch(batch, &pk_indices)?;
-            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                PK_KEY_COLUMN,
-                arrow_schema::DataType::Binary,
-                false,
-            )]));
-            let key_batch = RecordBatch::try_new(schema, vec![Arc::new(encoded)])
-                .map_err(|e| Error::invalid_input(e.to_string()))?;
-            if report_existing {
-                return index.insert_and_report_existing(&key_batch, row_offset);
+        let (index, key_batch) = match &self.pk_index {
+            Some(PkIndex::Owned(index)) => (index.as_ref() as &dyn PrimaryKeyIndex, batch.clone()),
+            Some(PkIndex::Composite { index, columns }) => {
+                let pk_indices = Self::pk_batch_indices(batch, columns)?;
+                let encoded = encode_pk_batch(batch, &pk_indices)?;
+                let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    PK_KEY_COLUMN,
+                    arrow_schema::DataType::Binary,
+                    false,
+                )]));
+                let key_batch = RecordBatch::try_new(schema, vec![Arc::new(encoded)])
+                    .map_err(|e| Error::invalid_input(e.to_string()))?;
+                (index.as_ref(), key_batch)
             }
-            index.insert(&key_batch, row_offset)?;
+            Some(PkIndex::Shared { .. }) | None => return Ok(false),
+        };
+        if report_existing {
+            return index.insert_and_report_existing(&key_batch, row_offset);
         }
+        index.insert(&key_batch, row_offset)?;
         Ok(false)
     }
 
@@ -614,8 +621,8 @@ impl IndexStore {
     ) -> Option<RowPosition> {
         match &self.pk_index {
             None => None,
-            Some(PkIndex::Single { index, .. }) => {
-                index.newest_visible(&values[0], max_visible_row)
+            Some(pk @ (PkIndex::Shared { .. } | PkIndex::Owned(_))) => {
+                pk.index().newest_visible(&values[0], max_visible_row)
             }
             Some(PkIndex::Composite { index, .. }) => {
                 // An unsupported PK type would have failed at insert, so the
@@ -651,9 +658,7 @@ impl IndexStore {
     pub fn pk_contains_key(&self, key: &ScalarValue, max_visible_row: RowPosition) -> bool {
         match &self.pk_index {
             None => false,
-            Some(PkIndex::Single { index, .. }) | Some(PkIndex::Composite { index, .. }) => {
-                index.newest_visible(key, max_visible_row).is_some()
-            }
+            Some(pk) => pk.index().newest_visible(key, max_visible_row).is_some(),
         }
     }
 
@@ -661,9 +666,7 @@ impl IndexStore {
     pub fn pk_is_empty(&self) -> bool {
         match &self.pk_index {
             None => true,
-            Some(PkIndex::Single { index, .. }) | Some(PkIndex::Composite { index, .. }) => {
-                index.is_empty()
-            }
+            Some(pk) => pk.index().is_empty(),
         }
     }
 
@@ -687,7 +690,7 @@ impl IndexStore {
 
     /// The single-column primary-key index, if `name` is the entry it shares.
     fn single_pk_at(&self, name: &str) -> Option<&Arc<dyn PrimaryKeyIndex>> {
-        let Some(PkIndex::Single { index, entry }) = &self.pk_index else {
+        let Some(PkIndex::Shared { index, entry }) = &self.pk_index else {
             return None;
         };
         (entry == name).then_some(index)
@@ -726,9 +729,8 @@ impl IndexStore {
                 None => index.insert(batch, row_offset)?,
             }
         }
-        // Single-column PK aliases a `btree_indexes` entry (maintained above);
-        // a composite PK has its own index, maintained here.
-        let had_existing = self.insert_composite_pk(batch, row_offset, track_pk_overrides)?;
+        // A key index this store owns is not among the entries above.
+        let had_existing = self.insert_owned_pk(batch, row_offset, track_pk_overrides)?;
         self.mark_pk_overrides_if_needed(had_existing);
 
         // Update the indexed prefix after every index has been updated.
@@ -867,13 +869,12 @@ impl IndexStore {
         }
         self.mark_pk_overrides_if_needed(had_existing_pk);
 
-        // Single-column PK aliases a `btree_indexes` entry — its task above already
-        // maintained it. A composite PK has its own index; maintain it here before the
-        // watermark advances so the visible prefix is fully indexed.
+        // A key index this store owns is not among the entries above; it is
+        // maintained before the watermark advances.
         let mut had_existing = false;
         for stored in batches {
             had_existing |=
-                self.insert_composite_pk(&stored.data, stored.row_offset, track_pk_overrides)?;
+                self.insert_owned_pk(&stored.data, stored.row_offset, track_pk_overrides)?;
         }
         self.mark_pk_overrides_if_needed(had_existing);
 
@@ -948,19 +949,20 @@ impl IndexStore {
             .collect()
     }
 
-    /// The index covering `column` that can answer `query`.
-    ///
-    /// The one way a query finds an index. Keyed on what an index covers and
-    /// what it can answer, never on which type it is, so a plugin standing in
-    /// for a kind Lance also builds in is found the same way — and two indexes
-    /// on one column are told apart by the question rather than by a label.
+    /// The index covering `column` that can answer `query`, the memtable's own
+    /// key index included.
     pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
+        let owned_pk = match &self.pk_index {
+            Some(PkIndex::Owned(index)) => Some(index.clone() as Arc<dyn MemIndex>),
+            _ => None,
+        };
         self.indexes
             .values()
+            .cloned()
+            .chain(owned_pk)
             .find(|index| {
                 index.columns().iter().any(|covered| covered == column) && index.can_answer(query)
             })
-            .cloned()
     }
 
     /// Every index covering `column`, whatever it can answer.
@@ -1103,11 +1105,10 @@ impl IndexStore {
             .values()
             .map(|index| index.resident_bytes())
             .sum();
-        // A single-column PK shares an entry in the map above, already counted.
-        // A composite PK's index is held only here.
+        // A shared key index is in the map above, already counted.
         let pk = match &self.pk_index {
-            Some(PkIndex::Composite { index, .. }) => index.resident_bytes(),
-            Some(PkIndex::Single { .. }) | None => 0,
+            Some(PkIndex::Shared { .. }) | None => 0,
+            Some(pk) => pk.index().resident_bytes(),
         };
         indexes + pk
     }

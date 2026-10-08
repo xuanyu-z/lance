@@ -7728,6 +7728,7 @@ impl MemIndexPlugin for FtsMemIndexPlugin {
     }
 
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
+        ctx.reject_overrides()?;
         Self::resolve_from_metadata(ctx.name, ctx.schema, ctx.index_meta)
     }
 

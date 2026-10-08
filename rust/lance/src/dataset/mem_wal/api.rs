@@ -2311,19 +2311,33 @@ mod tests {
         dataset
     }
 
-    /// Settings of a type the index's plugin does not read fail the writer
-    /// open, rather than leaving the index quietly on its defaults.
+    /// Settings a plugin does not read fail the writer open: settings of the
+    /// wrong type, or any for a kind that reads none.
+    #[rstest]
+    #[case::wrong_type("vector_idx")]
+    #[case::reads_none("id_idx")]
     #[tokio::test]
-    async fn test_a_mistyped_index_override_is_refused() {
+    async fn test_an_index_override_the_plugin_cannot_read_is_refused(#[case] index: &str) {
         let tmp = tempfile::tempdir().unwrap();
-        let dataset = vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        let mut dataset =
+            vector_table_maintaining_all(&format!("{}/base", tmp.path().display())).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id).with_index_override("vector_idx", 7u32);
+        let config = ShardWriterConfig::new(shard_id).with_index_override(index, 7u32);
         let Err(error) = dataset.mem_wal_writer(shard_id, config).await else {
             panic!("the writer must not open");
         };
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("vector_idx"), "{error}");
+        assert!(error.to_string().contains(index), "{error}");
     }
 
     /// One index named in both the HNSW settings and the generic ones is
