@@ -111,6 +111,7 @@ use crate::session::index_caches::{
 };
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
+pub(crate) use create::scalar_params_from_inverted;
 pub use lance_index::IndexDescription;
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {

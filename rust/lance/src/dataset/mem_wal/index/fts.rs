@@ -61,10 +61,10 @@ use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::scalar::IndexStore as _;
-use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_table::format::IndexMetadata;
 use lance_tokenizer::TokenStream;
 use rayon::prelude::*;
@@ -5150,6 +5150,11 @@ impl MemIndexPlugin for FtsMemIndexPlugin {
         TrainingCriteria::new(TrainingOrdering::None)
     }
 
+    /// Built from the generation's rows, the index keeps its own tokenizer.
+    fn flush_params(&self, spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
+        crate::index::scalar_params_from_inverted(&spec.params::<FtsParams>()?.params)
+    }
+
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         ctx.reject_overrides()?;
         Self::resolve_from_metadata(ctx.name, ctx.schema, ctx.index_meta)
@@ -5158,6 +5163,10 @@ impl MemIndexPlugin for FtsMemIndexPlugin {
     fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
         let (column, field_id) = ctx.single_column()?;
         let params = ctx.params::<FtsParams>()?;
+        params
+            .params
+            .validate_format_version()
+            .map_err(|error| Error::invalid_input(format!("FTS index '{}': {error}", ctx.name)))?;
 
         // Resolved at open, so an index that cannot be built fails the open
         // rather than a durable write.
@@ -5498,7 +5507,6 @@ mod tests {
         let index = FtsMemIndex::try_with_params(1, "tags".to_string(), params)
             .unwrap()
             .with_freeze_threshold_rows(1);
-        assert_eq!(index.column_name(), "tags");
         assert_eq!(index.column_name(), "tags");
 
         index.insert(&create_element_test_batch(), 0).unwrap();

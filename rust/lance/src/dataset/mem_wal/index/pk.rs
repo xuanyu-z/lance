@@ -30,11 +30,16 @@ pub(super) enum PkIndex {
         index: Arc<dyn PrimaryKeyIndex>,
         entry: String,
     },
-    /// The memtable's own B-tree over the key column, held apart from the named
-    /// indexes so no user index name can collide with it.
-    Owned(Arc<BTreeMemIndex>),
-    /// A B-tree over the encoded key tuple, which no batch carries, so it is
-    /// built from `columns` at insert.
+    /// A B-tree the store maintains itself, held apart from the named indexes
+    /// so no user index name can collide with it.
+    Owned(OwnedPk),
+}
+
+pub(super) enum OwnedPk {
+    /// Over the key column.
+    Single(Arc<BTreeMemIndex>),
+    /// Over the encoded key tuple, which no batch carries, so it is built from
+    /// `columns` at insert.
     Composite {
         index: Arc<BTreeMemIndex>,
         columns: Vec<String>,
@@ -61,10 +66,13 @@ impl PkIndex {
                         })
                     })
                     .unwrap_or_else(|| {
-                        Self::Owned(Arc::new(BTreeMemIndex::new(*field_id, column.clone())))
+                        Self::Owned(OwnedPk::Single(Arc::new(BTreeMemIndex::new(
+                            *field_id,
+                            column.clone(),
+                        ))))
                     }),
             ),
-            columns => Some(Self::Composite {
+            columns => Some(Self::Owned(OwnedPk::Composite {
                 index: Arc::new(BTreeMemIndex::new(
                     COMPOSITE_PK_FIELD_ID,
                     PK_KEY_COLUMN.to_string(),
@@ -75,26 +83,46 @@ impl PkIndex {
                     DataType::Binary,
                     false,
                 )])),
-            }),
+            })),
         }
     }
 
     pub(super) fn index(&self) -> &dyn PrimaryKeyIndex {
         match self {
             Self::Shared { index, .. } => index.as_ref(),
-            Self::Owned(index) | Self::Composite { index, .. } => index.as_ref(),
+            Self::Owned(owned) => owned.btree().as_ref(),
         }
     }
 
-    /// Whether the store maintains this index itself rather than with the
-    /// named indexes.
-    pub(super) fn is_owned(&self) -> bool {
-        !matches!(self, Self::Shared { .. })
+    /// The key index the store maintains itself, if it shares no user index.
+    pub(super) fn owned(&self) -> Option<&OwnedPk> {
+        match self {
+            Self::Shared { .. } => None,
+            Self::Owned(owned) => Some(owned),
+        }
     }
 
-    /// Index `batch` if this store owns the key index, reporting whether any
-    /// key was already held when `report_existing`.
-    pub(super) fn insert_owned(
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Self::Shared { entry, .. } => format!("shared({entry})"),
+            Self::Owned(OwnedPk::Single(index)) => format!("owned({})", index.column_name()),
+            Self::Owned(OwnedPk::Composite { columns, .. }) => {
+                format!("composite({})", columns.join(", "))
+            }
+        }
+    }
+}
+
+impl OwnedPk {
+    pub(super) fn btree(&self) -> &Arc<BTreeMemIndex> {
+        match self {
+            Self::Single(index) | Self::Composite { index, .. } => index,
+        }
+    }
+
+    /// Index `batch`, reporting whether any key was already held when
+    /// `report_existing`.
+    pub(super) fn insert(
         &self,
         batch: &RecordBatch,
         row_offset: RowPosition,
@@ -108,8 +136,7 @@ impl PkIndex {
             }
         };
         match self {
-            Self::Shared { .. } => Ok(false),
-            Self::Owned(index) => insert(index, batch),
+            Self::Single(index) => insert(index, batch),
             Self::Composite {
                 index,
                 columns,
@@ -131,14 +158,6 @@ impl PkIndex {
                 )?;
                 insert(index, &keys)
             }
-        }
-    }
-
-    pub(super) fn describe(&self) -> String {
-        match self {
-            Self::Shared { entry, .. } => format!("shared({entry})"),
-            Self::Owned(index) => format!("owned({})", index.column_name()),
-            Self::Composite { columns, .. } => format!("composite({})", columns.join(", ")),
         }
     }
 }
@@ -178,7 +197,7 @@ impl IndexStore {
         max_visible_row: RowPosition,
     ) -> Option<RowPosition> {
         match (self.pk_index.as_ref()?, values) {
-            (PkIndex::Composite { index, columns, .. }, values)
+            (PkIndex::Owned(OwnedPk::Composite { index, columns, .. }), values)
                 if values.len() == columns.len() =>
             {
                 // Insert encoded every stored key the same way, so a key that
@@ -186,7 +205,7 @@ impl IndexStore {
                 let key = encode_pk_tuple(values).ok()?;
                 index.newest_visible(&ScalarValue::Binary(Some(key)), max_visible_row)
             }
-            (PkIndex::Composite { .. }, _) => None,
+            (PkIndex::Owned(OwnedPk::Composite { .. }), _) => None,
             (pk, [value]) => pk.index().newest_visible(value, max_visible_row),
             (_, _) => None,
         }

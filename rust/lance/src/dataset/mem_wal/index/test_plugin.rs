@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! A built-in memtable index plugin under another type, for testing what the
-//! memtable assumes about plugins it does not know.
+//! A built-in memtable index plugin under another type with the same name, for
+//! testing what the memtable assumes about plugins it does not know.
 
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::expression::ScalarQueryParser;
@@ -17,7 +17,7 @@ use lance_index::scalar::registry::TrainingCriteria;
 use super::fts::FtsQueryExpr;
 use super::{
     FlushContext, FlushOutcome, FtsMemQuery, MemIndex, MemIndexBuildContext, MemIndexPlugin,
-    MemIndexSpec, MemMatches, MemQuery, MemSearchResult, PositionSet, PrimaryKeyIndex,
+    MemIndexSpec, MemMatches, MemQuery, MemSearchResult, PositionSet, PrimaryKeyIndex, RankedMatch,
     ResolveContext, ResolvedIndex, RowPosition, SearchContext, VectorMemQuery,
 };
 
@@ -40,6 +40,16 @@ pub enum Deviation {
     FreshKeyCapability,
     /// Asks the flush to build it from the generation.
     AsksForABuild,
+    /// Adds the first row past the visible ones to every answer, ranked first.
+    AnswersPastVisible,
+    /// Covers the key column but cannot serve as the primary-key index.
+    NotAKeyIndex,
+    /// Fails its flush.
+    FailsToFlush,
+    /// Records the file it wrote under another index name.
+    RecordsAnotherName,
+    /// Panics on every insert.
+    PanicsOnInsert,
 }
 
 /// `spec`, maintained by its plugin wrapped with `deviation`.
@@ -73,7 +83,7 @@ struct Wrapped {
 #[async_trait::async_trait]
 impl MemIndexPlugin for Wrapped {
     fn name(&self) -> &str {
-        "Wrapped"
+        self.inner.name()
     }
     fn details_message(&self) -> &str {
         self.inner.details_message()
@@ -84,10 +94,11 @@ impl MemIndexPlugin for Wrapped {
     fn training_criteria(&self) -> TrainingCriteria {
         self.inner.training_criteria()
     }
-    fn flush_params(&self, spec: &MemIndexSpec) -> ScalarIndexParams {
-        self.flush_params
-            .clone()
-            .unwrap_or_else(|| self.inner.flush_params(spec))
+    fn flush_params(&self, spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
+        match &self.flush_params {
+            Some(params) => Ok(params.clone()),
+            None => self.inner.flush_params(spec),
+        }
     }
     fn query_parser(
         &self,
@@ -141,6 +152,10 @@ impl MemIndex for WrappedIndex {
             }
     }
     fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
+        assert!(
+            self.deviation != Deviation::PanicsOnInsert,
+            "insert panicked"
+        );
         self.inner.insert(batch, row_offset)
     }
     fn resident_bytes(&self) -> usize {
@@ -153,50 +168,51 @@ impl MemIndex for WrappedIndex {
             Deviation::AnswersCandidates => Ok(Some(MemMatches::Filter(MemSearchResult::at_most(
                 PositionSet::all_visible(ctx.max_visible),
             )))),
+            Deviation::AnswersPastVisible => {
+                let hidden = ctx.max_visible + 1;
+                Ok(match self.inner.search(query, ctx)? {
+                    Some(MemMatches::Filter(mut result)) => {
+                        result.at_least.insert(hidden);
+                        result.at_most.insert(hidden);
+                        Some(MemMatches::Filter(result))
+                    }
+                    Some(MemMatches::Ranked(mut matches)) => {
+                        matches.insert(0, RankedMatch::new(hidden, 0.0));
+                        Some(MemMatches::Ranked(matches))
+                    }
+                    None => None,
+                })
+            }
             _ if !self.can_answer(query) => Ok(None),
             _ => self.inner.search(query, ctx),
         }
     }
     async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
-        if self.deviation == Deviation::AsksForABuild {
-            return Ok(FlushOutcome::BuildFromGeneration);
+        match self.deviation {
+            Deviation::AsksForABuild => Ok(FlushOutcome::BuildFromGeneration),
+            Deviation::FailsToFlush => Err(Error::internal("flush failed")),
+            Deviation::RecordsAnotherName => match self.inner.flush(ctx).await? {
+                FlushOutcome::Wrote(mut index_meta) => {
+                    index_meta.name = "another_name".to_string();
+                    Ok(FlushOutcome::Wrote(index_meta))
+                }
+                outcome => Ok(outcome),
+            },
+            _ => self.inner.flush(ctx).await,
         }
-        self.inner.flush(ctx).await
     }
     fn as_primary_key(self: Arc<Self>) -> Option<Arc<dyn PrimaryKeyIndex>> {
         let key = self.inner.clone().as_primary_key()?;
         match self.deviation {
             Deviation::FreshKeyCapability => Some(Arc::new(KeyCapability(key))),
+            Deviation::NotAKeyIndex => None,
             _ => Some(key),
         }
     }
 }
 
 /// A primary-key capability allocated afresh, around the same index.
-#[derive(Debug)]
 struct KeyCapability(Arc<dyn PrimaryKeyIndex>);
-
-#[async_trait::async_trait]
-impl MemIndex for KeyCapability {
-    fn columns(&self) -> &[String] {
-        self.0.columns()
-    }
-    fn can_answer(&self, query: &dyn MemQuery) -> bool {
-        self.0.can_answer(query)
-    }
-    fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
-        self.0.insert(batch, row_offset)
-    }
-    fn resident_bytes(&self) -> usize {
-        self.0.resident_bytes()
-    }
-    fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
-        self.0.search(query, ctx)
-    }
-    async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
-        self.0.flush(ctx).await
-    }
-}
 
 impl PrimaryKeyIndex for KeyCapability {
     fn insert_and_report_existing(

@@ -1738,7 +1738,7 @@ mod tests {
     use crate::dataset::mem_wal::index::MemIndexSpec;
     use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
     use arrow_array::{
-        BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
+        ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
 
@@ -3199,6 +3199,35 @@ mod tests {
         );
     }
 
+    /// A null is in no range, though each B-tree backend sorts null keys
+    /// first.
+    #[rstest::rstest]
+    #[case::int(Arc::new(Int32Array::from(vec![None, Some(1), Some(3)])) as ArrayRef, "v < 2")]
+    #[case::string(Arc::new(StringArray::from(vec![None, Some("a"), Some("c")])) as ArrayRef, "v < 'b'")]
+    #[case::float(Arc::new(Float64Array::from(vec![None, Some(1.0), Some(3.0)])) as ArrayRef, "v < 2.0")]
+    #[tokio::test]
+    async fn an_open_lower_bound_excludes_nulls(#[case] values: ArrayRef, #[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.add_btree("v_idx".to_string(), 0, "v".to_string());
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        batch_store.append(batch).unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.filter(filter).unwrap();
+        let found = scanner.try_into_batch().await.unwrap();
+        assert_eq!(found.num_rows(), 1);
+        assert_eq!(found["v"].null_count(), 0);
+    }
+
     fn ids(batch: &RecordBatch) -> Vec<i32> {
         let mut ids = batch
             .column_by_name("id")
@@ -3222,6 +3251,8 @@ mod tests {
         indexes
             .insert_with_batch_position(&batch, offset, Some(position))
             .unwrap();
+        // Appended but never indexed, so not yet readable.
+        batch_store.append(batch).unwrap();
         MemTableScanner::new(batch_store, Arc::new(indexes), schema)
     }
 
@@ -3259,25 +3290,14 @@ mod tests {
         assert_eq!(ids(&scanner.try_into_batch().await.unwrap()), vec![1]);
     }
 
-    /// A filter index may decline, and every row is then read; a failed search
-    /// is an error, never an empty answer.
-    #[tokio::test]
-    async fn a_filter_index_that_declines_is_read_past_and_one_that_fails_errors() {
-        let schema = create_test_schema();
-        let filtered = |deviation| {
-            let mut scanner =
-                memtable_over(&[id_btree(deviation)], create_test_batch(&schema, 0, 10));
-            scanner.filter("id = 1").unwrap();
-            scanner
-        };
-        let declined = filtered(Deviation::AcceptsThenDeclines);
-        assert_eq!(ids(&declined.try_into_batch().await.unwrap()), vec![1]);
-        assert!(
-            filtered(Deviation::AcceptsThenFails)
-                .try_into_batch()
-                .await
-                .is_err()
+    /// The ids `scanner` finds, and the plan that found them.
+    async fn found(scanner: MemTableScanner) -> Result<(Vec<i32>, String)> {
+        let plan = scanner.create_plan().await?;
+        let plan = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
         );
+        Ok((ids(&scanner.try_into_batch().await?), plan))
     }
 
     fn vector_batch() -> RecordBatch {
@@ -3306,24 +3326,18 @@ mod tests {
         .unwrap()
     }
 
-    /// The three nearest ids, and the plan that found them.
-    async fn nearest_ids(specs: &[MemIndexSpec]) -> Result<(Vec<i32>, String)> {
-        let mut scanner = memtable_over(specs, vector_batch());
+    /// The three nearest neighbours, through an HNSW that deviates.
+    fn nearest(deviation: Deviation) -> MemTableScanner {
+        let mut scanner = memtable_over(
+            &[wrapped(
+                MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2),
+                deviation,
+            )],
+            vector_batch(),
+        );
         let query: Arc<dyn Array> = Arc::new(arrow_array::Float32Array::from(vec![3.0_f32, 1.5]));
         scanner.nearest("vector", query.as_ref(), 3).unwrap();
-        let plan = scanner.create_plan().await?;
-        let plan = format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
-        );
-        Ok((ids(&scanner.try_into_batch().await?), plan))
-    }
-
-    fn vector_index(deviation: Deviation) -> MemIndexSpec {
-        wrapped(
-            MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2),
-            deviation,
-        )
+        scanner
     }
 
     /// A vector index is chosen by the search it will run: one that declines it
@@ -3336,21 +3350,13 @@ mod tests {
         #[case] deviation: Deviation,
         #[case] route: &str,
     ) {
-        let (ids, plan) = nearest_ids(&[vector_index(deviation)]).await.unwrap();
+        let (ids, plan) = found(nearest(deviation)).await.unwrap();
         assert_eq!(ids, vec![2, 3, 4]);
         assert!(plan.contains(route), "{plan}");
     }
 
-    /// Declining at search time a search accepted while planning is an error.
-    #[tokio::test]
-    async fn a_vector_index_that_declines_after_accepting_is_an_error() {
-        let error = nearest_ids(&[vector_index(Deviation::AcceptsThenDeclines)])
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("did not answer"), "{error}");
-    }
-
-    async fn name_search(deviation: Deviation) -> Result<Vec<i32>> {
+    /// A text search for `5` in `name`, through a full-text index that deviates.
+    fn name_search(deviation: Deviation) -> MemTableScanner {
         let schema = create_test_schema();
         let mut scanner = memtable_over(
             &[wrapped(MemIndexSpec::fts("name_fts", 1, "name"), deviation)],
@@ -3363,18 +3369,123 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        Ok(ids(&scanner.try_into_batch().await?))
+        scanner
     }
 
-    /// A full-text index is chosen by the search it will run, and declining it
-    /// after accepting is an error.
+    /// A full-text index that declines only the granularity probe still answers.
     #[tokio::test]
     async fn a_full_text_index_is_chosen_by_the_real_search() {
-        assert_eq!(
-            name_search(Deviation::DeclinesProbes).await.unwrap(),
-            vec![5]
+        let (ids, _) = found(name_search(Deviation::DeclinesProbes)).await.unwrap();
+        assert_eq!(ids, vec![5]);
+    }
+
+    /// One text search over `title` and `body`, the index on `title` deviating.
+    fn title_and_body_search(deviation: Deviation) -> MemTableScanner {
+        use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["red apple", "green pear", "plum"])),
+                Arc::new(StringArray::from(vec!["sweet", "red skin", "sour"])),
+            ],
+        )
+        .unwrap();
+        let mut scanner = memtable_over(
+            &[
+                wrapped(MemIndexSpec::fts("title_fts", 1, "title"), deviation),
+                MemIndexSpec::fts("body_fts", 2, "body"),
+            ],
+            batch,
         );
-        assert!(name_search(Deviation::AcceptsThenDeclines).await.is_err());
+        let columns = vec!["title".to_string(), "body".to_string()];
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::MultiMatch(
+                MultiMatchQuery::try_new("red".to_string(), columns).unwrap(),
+            )))
+            .unwrap();
+        scanner
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Search {
+        Filter,
+        Nearest,
+        Text,
+        TextAcrossColumns,
+    }
+
+    impl Search {
+        fn scanner(self, deviation: Deviation) -> MemTableScanner {
+            match self {
+                Self::Filter => {
+                    let schema = create_test_schema();
+                    let mut scanner =
+                        memtable_over(&[id_btree(deviation)], create_test_batch(&schema, 0, 10));
+                    scanner.filter("id < 3").unwrap();
+                    scanner
+                }
+                Self::Nearest => nearest(deviation),
+                Self::Text => name_search(deviation),
+                Self::TextAcrossColumns => title_and_body_search(deviation),
+            }
+        }
+
+        /// The ids an index that keeps its contract finds, and the plan node
+        /// that asks it.
+        fn expected(self) -> (Vec<i32>, &'static str) {
+            match self {
+                Self::Filter => (vec![0, 1, 2], "ScalarIndexExec"),
+                Self::Nearest => (vec![2, 3, 4], "VectorIndexExec"),
+                Self::Text => (vec![5], "FtsIndexExec"),
+                Self::TextAcrossColumns => (vec![0, 1], "FtsIndexExec"),
+            }
+        }
+    }
+
+    /// Every search goes to its index and never returns a row past what is
+    /// readable. An index that fails a search it accepted fails it, and so does
+    /// one that declines it, except a filter index, which is read past.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn a_search_holds_its_index_to_what_it_accepted(
+        #[values(
+            Search::Filter,
+            Search::Nearest,
+            Search::Text,
+            Search::TextAcrossColumns
+        )]
+        search: Search,
+        #[values(
+            Deviation::None,
+            Deviation::AnswersPastVisible,
+            Deviation::AcceptsThenDeclines,
+            Deviation::AcceptsThenFails
+        )]
+        deviation: Deviation,
+    ) {
+        let result = found(search.scanner(deviation)).await;
+        let message = match deviation {
+            Deviation::AcceptsThenDeclines if !matches!(search, Search::Filter) => {
+                "then did not answer it"
+            }
+            Deviation::AcceptsThenFails => "search failed",
+            _ => {
+                let (ids, route) = search.expected();
+                let (found, plan) = result.unwrap();
+                assert_eq!(found, ids);
+                assert!(plan.contains(route), "{plan}");
+                return;
+            }
+        };
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     fn scan_ids(batch: &RecordBatch) -> Vec<i32> {

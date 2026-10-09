@@ -175,8 +175,12 @@ impl VectorIndexExec {
                 "the index on '{column}' accepted a vector search, then did not answer it"
             )));
         };
-        let mut results: Vec<(f32, u64)> =
-            matches.into_iter().map(|m| (m.score, m.position)).collect();
+        // A row past the readable count may still fail its append.
+        let mut results: Vec<(f32, u64)> = matches
+            .into_iter()
+            .filter(|m| m.position <= max_readable_row)
+            .map(|m| (m.score, m.position))
+            .collect();
 
         if self.query.distance_lower_bound.is_some() || self.query.distance_upper_bound.is_some() {
             results.retain(|&(dist, _)| {
@@ -356,7 +360,7 @@ impl ExecutionPlan for VectorIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 

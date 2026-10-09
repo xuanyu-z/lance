@@ -58,9 +58,9 @@ pub struct MemIndexBuildContext<'a> {
     pub field_ids: &'a [i32],
     /// Those fields' column names, in the same order.
     pub columns: &'a [String],
-    /// Most rows the memtable holds before it flushes.
+    /// Most rows the memtable holds before it flushes; 0 while validating.
     pub capacity_rows: usize,
-    /// Most batches the memtable holds.
+    /// Most batches the memtable holds; 0 while validating.
     pub capacity_batches: usize,
     /// Whatever [`MemIndexPlugin::resolve`] returned for this index.
     pub params: &'a dyn MemIndexParams,
@@ -82,14 +82,7 @@ impl MemIndexBuildContext<'_> {
     /// Check that every covered column is in the schema under the field id the
     /// spec names. A plugin indexing a nested path checks that path itself.
     pub fn check_columns_resolve(&self) -> Result<()> {
-        if self.columns.len() != self.field_ids.len() {
-            return Err(Error::invalid_input(format!(
-                "index '{}' names {} columns but {} field ids",
-                self.name,
-                self.columns.len(),
-                self.field_ids.len()
-            )));
-        }
+        check_column_count(self.name, self.columns, self.field_ids)?;
         for (column, field_id) in self.columns.iter().zip(self.field_ids) {
             let field = self.schema.field(column).ok_or_else(|| {
                 Error::invalid_input(format!(
@@ -135,15 +128,16 @@ impl MemIndexBuildContext<'_> {
     /// `params` as `P`, the type this plugin's own
     /// [`resolve`](MemIndexPlugin::resolve) returned.
     pub fn params<P: Any>(&self) -> Result<&P> {
-        (self.params as &dyn Any)
-            .downcast_ref::<P>()
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "index '{}' was built with params of an unexpected type",
-                    self.name
-                ))
-            })
+        downcast_params(self.name, self.params)
     }
+}
+
+fn downcast_params<'a, P: Any>(name: &str, params: &'a dyn MemIndexParams) -> Result<&'a P> {
+    (params as &dyn Any).downcast_ref::<P>().ok_or_else(|| {
+        Error::internal(format!(
+            "index '{name}' was built with params of an unexpected type"
+        ))
+    })
 }
 
 /// What an index needs to resolve its build params from the base table.
@@ -198,7 +192,7 @@ pub struct ResolvedIndex {
     /// over a list of structs covers `tags.name`, not `tags`.
     pub columns: Vec<String>,
     /// Each column's field id, when the plugin resolved them itself; `None`
-    /// keeps the base-table index's own.
+    /// keeps the base index's ids for its own columns and looks up any other.
     pub field_ids: Option<Vec<i32>>,
     /// Whatever the plugin needs when it builds an index.
     pub params: Arc<dyn MemIndexParams>,
@@ -386,8 +380,9 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
 /// An index that can also serve as the memtable's primary-key index.
 ///
 /// Only a user index on exactly the key column is shared this way; otherwise
-/// the memtable keeps a B-tree of its own.
-pub trait PrimaryKeyIndex: MemIndex {
+/// the memtable keeps a B-tree of its own. Until a key is rewritten, the store
+/// inserts through [`insert_and_report_existing`](Self::insert_and_report_existing).
+pub trait PrimaryKeyIndex: Send + Sync {
     /// Index a batch and report whether any row's key was already held, or
     /// repeats earlier in the batch.
     fn insert_and_report_existing(
@@ -408,8 +403,12 @@ pub trait PrimaryKeyIndex: MemIndex {
 }
 
 /// Declares one memtable index kind and builds instances of it.
+///
+/// A writer tells kinds apart by their Rust type and [`version`](Self::version),
+/// so whatever else decides how an index is built belongs in the params
+/// [`resolve`](Self::resolve) returns.
 #[async_trait::async_trait]
-pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
+pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug + Any {
     /// A short name for plans and errors, for example `BTree`.
     fn name(&self) -> &str;
 
@@ -431,8 +430,8 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// The parameters the flush builds a scalar on-disk index with: the index
     /// type's defaults unless overridden.
-    fn flush_params(&self, _spec: &MemIndexSpec) -> ScalarIndexParams {
-        ScalarIndexParams::default()
+    fn flush_params(&self, _spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::default())
     }
 
     /// The parser the on-disk index of this kind uses, so a filter expression
@@ -448,15 +447,17 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug {
     }
 
     /// Resolve this index against the base table: the columns it covers and
-    /// what it needs to build one. Runs once per writer; do any I/O here so
-    /// [`create`](Self::create) need not. The default reads no writer settings
-    /// and refuses any.
+    /// what it needs to build one. Runs each time a writer opens or refreshes
+    /// its index set; do any I/O here so [`create`](Self::create) need not.
+    /// The default reads no writer settings and refuses any.
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         ctx.reject_overrides()?;
         Ok(ResolvedIndex::plain(ctx.columns.to_vec()))
     }
 
     /// Reject a column this index cannot maintain, before any row is written.
+    /// A writer opens on this alone, so [`create`](Self::create) must not fail
+    /// for a spec it accepts.
     fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()>;
 
     /// Build an empty index.
@@ -587,16 +588,23 @@ impl MemIndexSpec {
     }
 
     /// Whether `other` describes the same index: name, columns, field ids,
-    /// plugin, plugin version, settings and base-table details.
+    /// plugin type, plugin version, settings and base-table details.
     pub fn same_index(&self, other: &Self) -> bool {
         self.name == other.name
             && self.columns == other.columns
             && self.field_ids == other.field_ids
-            && self.plugin.name() == other.plugin.name()
+            && (self.plugin.as_ref() as &dyn Any).type_id()
+                == (other.plugin.as_ref() as &dyn Any).type_id()
             && self.plugin.details_message() == other.plugin.details_message()
             && self.plugin.version() == other.plugin.version()
             && self.params.same_as(other.params.as_ref())
             && self.details == other.details
+    }
+
+    /// `params` as `P`, the type its plugin's own
+    /// [`resolve`](MemIndexPlugin::resolve) returned.
+    pub fn params<P: Any>(&self) -> Result<&P> {
+        downcast_params(&self.name, self.params.as_ref())
     }
 
     /// The context this spec's plugin validates and builds against.
@@ -619,6 +627,7 @@ impl MemIndexSpec {
 
     /// Check that this spec's plugin can maintain it against `schema`.
     pub fn validate(&self, schema: &LanceSchema) -> Result<()> {
+        check_column_count(&self.name, &self.columns, &self.field_ids)?;
         self.plugin.validate(&self.build_context(schema, 0, 0))
     }
 
@@ -629,9 +638,22 @@ impl MemIndexSpec {
         capacity_rows: usize,
         capacity_batches: usize,
     ) -> Result<Arc<dyn MemIndex>> {
+        check_column_count(&self.name, &self.columns, &self.field_ids)?;
         self.plugin
             .create(&self.build_context(schema, capacity_rows, capacity_batches))
     }
+}
+
+/// Columns and field ids are parallel lists; a plugin indexes them pairwise.
+fn check_column_count(name: &str, columns: &[String], field_ids: &[i32]) -> Result<()> {
+    if columns.len() != field_ids.len() {
+        return Err(Error::invalid_input(format!(
+            "index '{name}' names {} columns but {} field ids",
+            columns.len(),
+            field_ids.len()
+        )));
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for MemIndexSpec {

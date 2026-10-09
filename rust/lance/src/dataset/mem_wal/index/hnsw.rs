@@ -633,8 +633,8 @@ async fn write_graph(
         .get(HNSW_METADATA_KEY)
         .cloned()
         .ok_or_else(|| Error::internal("HNSW graph batch has no HNSW metadata"))?;
-    // Fullzip: the miniblock list codec mis-decodes the graph's dense-then-empty
-    // neighbour lists, and at 2.1 overflows its chunk cap.
+    // Fullzip: the miniblock list codec decodes the graph's dense-then-empty
+    // neighbour lists wrongly, and at 2.1 overflows its chunk cap.
     let fullzip = HashMap::from([(
         STRUCTURAL_ENCODING_META_KEY.to_string(),
         STRUCTURAL_ENCODING_FULLZIP.to_string(),
@@ -724,7 +724,7 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
         };
 
         // Inherit the base metric so distances compare across tiers; a flushed
-        // graph stores the metric it was built with.
+        // graph stores it, so a failed open is an error, never a default.
         let recorded = ctx
             .index_meta
             .index_details
@@ -736,7 +736,13 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
             None => ctx
                 .dataset
                 .open_vector_index(column, &ctx.index_meta.uuid, &NoOpMetricsCollector)
-                .await?
+                .await
+                .map_err(|e| {
+                    Error::invalid_input(format!(
+                        "failed to open base vector index '{}' to inherit its distance type: {e}",
+                        ctx.name
+                    ))
+                })?
                 .metric_type(),
         };
 

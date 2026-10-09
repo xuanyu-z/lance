@@ -995,7 +995,12 @@ async fn build_index_specs(
         .collect();
 
     let mut index_specs = Vec::with_capacity(index_names.len());
+    let mut listed = std::collections::HashSet::new();
     for index_name in index_names {
+        // A name listed twice is one index.
+        if !listed.insert(index_name.as_str()) {
+            continue;
+        }
         // A maintained index can split into multiple physical segments
         // (e.g. `optimize_indices(append)` deltas), which the singular
         // `load_index_by_name` rejects. Every segment carries the same
@@ -1060,6 +1065,8 @@ async fn build_index_specs(
             }
         };
 
+        // Not skipped under maintain-all: resolving reads the base index, and a
+        // read that fails once must not drop the index for the writer's life.
         let resolved = plugin
             .resolve(&ResolveContext {
                 name: index_name,
@@ -2126,9 +2133,9 @@ mod tests {
     use super::super::index::BTreeMemIndexPlugin;
 
     /// Claims a kind no built-in plugin maintains (the base table's zone map)
-    /// and maintains and flushes it as a B-tree.
+    /// and maintains and flushes it as a B-tree, on the named column if any.
     #[derive(Debug)]
-    struct UnclaimedKindAsBTree;
+    struct UnclaimedKindAsBTree(Option<&'static str>);
 
     #[async_trait::async_trait]
     impl super::super::index::MemIndexPlugin for UnclaimedKindAsBTree {
@@ -2143,6 +2150,16 @@ mod tests {
         }
         fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
             BTreeMemIndexPlugin.training_criteria()
+        }
+        async fn resolve(
+            &self,
+            ctx: &super::super::index::ResolveContext<'_>,
+        ) -> Result<super::super::index::ResolvedIndex> {
+            let columns = match self.0 {
+                Some(column) => vec![column.to_string()],
+                None => ctx.columns.to_vec(),
+            };
+            Ok(super::super::index::ResolvedIndex::plain(columns))
         }
         fn validate(&self, ctx: &super::super::index::MemIndexBuildContext<'_>) -> Result<()> {
             BTreeMemIndexPlugin.validate(ctx)
@@ -2224,7 +2241,7 @@ mod tests {
         assert!(error.to_string().contains("id_zone_map"), "{error}");
 
         let registry = MemIndexRegistry::default()
-            .with_plugin(Arc::new(UnclaimedKindAsBTree))
+            .with_plugin(Arc::new(UnclaimedKindAsBTree(None)))
             .unwrap();
         dataset
             .update_mem_wal_maintained_indexes_with(named, &registry)
@@ -2232,15 +2249,65 @@ mod tests {
             .unwrap();
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_mem_index_plugin(Arc::new(UnclaimedKindAsBTree))
+        let added = ShardWriterConfig::new(shard_id)
+            .with_mem_index_plugin(Arc::new(UnclaimedKindAsBTree(None)))
             .unwrap();
+        assert!(
+            added
+                .mem_index_registry
+                .plugin_for_details_url("ZoneMapIndexDetails")
+                .is_some()
+        );
+        let config = ShardWriterConfig::new(shard_id).with_mem_index_registry(registry);
         let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
         assert_eq!(
             writer.maintained_index_names().await,
             vec!["id_zone_map".to_string()]
         );
         writer.close().await.unwrap();
+    }
+
+    /// A plugin that resolves an index to other columns gets their field ids
+    /// from the shard schema; a column the schema lacks skips the index under
+    /// maintain-all and refuses a named set.
+    #[tokio::test]
+    async fn test_an_index_resolved_to_other_columns_takes_their_field_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let dataset = id_v_dataset_with_zone_map_and_btree(&uri).await;
+        let specs = |column: &'static str, on_unsupported: OnUnsupportedIndex| {
+            let registry = MemIndexRegistry::default()
+                .with_plugin(Arc::new(UnclaimedKindAsBTree(Some(column))))
+                .unwrap();
+            let dataset = &dataset;
+            async move {
+                build_index_specs(
+                    dataset,
+                    &["id_zone_map".to_string()],
+                    &HashMap::new(),
+                    &registry,
+                    OnMissingIndex::Reject,
+                    on_unsupported,
+                )
+                .await
+            }
+        };
+
+        let moved = specs("v", OnUnsupportedIndex::Reject).await.unwrap();
+        assert_eq!(moved[0].columns, vec!["v".to_string()]);
+        assert_eq!(
+            moved[0].field_ids,
+            vec![dataset.schema().field("v").unwrap().id]
+        );
+
+        assert!(
+            specs("nope", OnUnsupportedIndex::Skip)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let error = specs("nope", OnUnsupportedIndex::Reject).await.unwrap_err();
+        assert!(error.to_string().contains("'nope'"), "{error}");
     }
 
     async fn vector_table_maintaining_all(uri: &str) -> Dataset {
@@ -2310,6 +2377,41 @@ mod tests {
         assert_eq!(
             writer.maintained_index_names().await,
             vec!["vector_idx".to_string()]
+        );
+        writer.close().await.unwrap();
+    }
+
+    /// A maintained set naming one index twice maintains it once.
+    #[tokio::test]
+    async fn test_an_index_named_twice_is_maintained_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let mut dataset = id_v_dataset(&uri, &[1, 2]).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .maintained_indexes(["id_idx", "id_idx"])
+            .execute()
+            .await
+            .unwrap();
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["id_idx".to_string()]
         );
         writer.close().await.unwrap();
     }

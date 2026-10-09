@@ -691,6 +691,8 @@ fn from_specs_builds_each_index_under_its_name() {
     assert_eq!(store.get_fts("desc_idx").unwrap().doc_count(), 3);
     assert!(store.get_btree("desc_idx").is_none());
     assert!(store.get_fts("missing").is_none());
+    assert_eq!(store.index_names(), vec!["desc_idx", "id_idx"]);
+    assert!(!store.is_empty() && IndexStore::new().is_empty());
 }
 
 /// Two indexes under one name would leave one of them unmaintained.
@@ -922,6 +924,13 @@ fn test_resident_bytes_includes_plugin_growth() {
         store.resident_bytes() > 0,
         "indexed rows must be charged to the store total"
     );
+    let mut text = IndexStore::new();
+    text.add_fts("desc_idx".to_string(), 2, "description".to_string());
+    text.insert(&batch, 0).unwrap();
+    assert!(
+        text.resident_bytes() > 1,
+        "a full-text index charges its rows"
+    );
     assert_eq!(
         store.resident_bytes(),
         store.get_index("id_stub").unwrap().resident_bytes(),
@@ -964,6 +973,17 @@ fn vector_schema() -> Arc<ArrowSchema> {
     MemIndexSpec::fts("idx", 9, "nope"),
     Some("does not exist in the dataset schema")
 )]
+#[case::fts_format_without_code_support(
+    MemIndexSpec::fts_with_params(
+        "idx",
+        1,
+        "description",
+        InvertedIndexParams::default()
+            .base_tokenizer("code".to_string())
+            .format_version(InvertedListFormatVersion::V2),
+    ),
+    Some("requires FTS format_version=3")
+)]
 #[case::hnsw_ok(MemIndexSpec::hnsw("idx", 2, "vector", DistanceType::L2), None)]
 #[case::hnsw_not_a_vector(
     MemIndexSpec::hnsw("idx", 0, "id", DistanceType::L2),
@@ -971,7 +991,7 @@ fn vector_schema() -> Arc<ArrowSchema> {
 )]
 #[case::hnsw_wrong_item_type(
     MemIndexSpec::hnsw("idx", 3, "f64_vector", DistanceType::L2),
-    Some("Float64")
+    Some("column 'f64_vector' is FixedSizeList")
 )]
 #[case::hnsw_missing_column(
     MemIndexSpec::hnsw("idx", 9, "nope", DistanceType::L2),
@@ -1234,7 +1254,8 @@ fn a_stand_in_full_text_index_reports_its_granularity() {
 }
 
 /// Settings that differ only in a cached schema lookup are the same index; a
-/// different plugin, column or field is not.
+/// plugin of another type with the same name, or another column or field, is
+/// not.
 #[test]
 fn same_index_compares_what_an_index_is_built_from() {
     let arrow = ArrowSchema::new(vec![Field::new("text", DataType::Utf8, true)]);
@@ -1257,12 +1278,70 @@ fn same_index_compares_what_an_index_is_built_from() {
     assert!(!unresolved.same_index(&stand_in(unresolved.clone())));
     assert!(!unresolved.same_index(&MemIndexSpec::fts("text_fts", 0, "other")));
     assert!(!unresolved.same_index(&MemIndexSpec::fts("text_fts", 1, "text")));
+    assert!(!unresolved.same_index(&MemIndexSpec::fts_with_params(
+        "text_fts",
+        0,
+        "text",
+        InvertedIndexParams::default().with_position(true),
+    )));
     let mut rebuilt = unresolved.clone();
     rebuilt.details = Some(Arc::new(prost_types::Any {
         type_url: "/lance.table.InvertedIndexDetails".to_string(),
         value: vec![1],
     }));
     assert!(!unresolved.same_index(&rebuilt));
+}
+
+/// One index listed twice is one index; two different ones under one name are
+/// refused before any is built.
+#[test]
+fn validate_index_specs_refuses_a_name_used_twice() {
+    let schema = create_test_schema();
+    let same = [
+        MemIndexSpec::btree("idx", 0, "id"),
+        MemIndexSpec::btree("idx", 0, "id"),
+    ];
+    validate_index_specs(&same, &schema, &test_lance_schema(), &[]).unwrap();
+    let different = [
+        MemIndexSpec::btree("idx", 0, "id"),
+        MemIndexSpec::btree("idx", 1, "name"),
+    ];
+    let error = validate_index_specs(&different, &schema, &test_lance_schema(), &[]).unwrap_err();
+    assert!(error.to_string().contains("configured twice"), "{error}");
+}
+
+/// Columns and field ids that do not pair up are refused, whatever the plugin
+/// checks itself.
+#[test]
+fn a_spec_whose_columns_and_field_ids_differ_in_count_is_refused() {
+    let mut spec = MemIndexSpec::for_plugin("idx", 0, "id", Arc::new(StubPlugin("StubDetails")));
+    spec.field_ids.push(1);
+    let schema = test_lance_schema();
+    for error in [
+        spec.validate(&schema).unwrap_err(),
+        spec.build(&schema, 10, 1).unwrap_err(),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("names 1 columns but 2 field ids"),
+            "{error}"
+        );
+    }
+}
+
+/// A composite key needs every key column in each batch.
+#[test]
+fn a_composite_key_column_missing_from_a_batch_fails_the_insert() {
+    let mut store = IndexStore::new();
+    store.enable_pk_index(&[("id".to_string(), 0), ("name".to_string(), 1)]);
+    let error = store.insert(&id_batch(&[1]), 0).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("primary-key column 'name' is not in the batch"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1302,19 +1381,25 @@ fn a_shared_key_index_tracks_rewrites_through_a_fresh_capability() {
 }
 
 /// A user index on exactly the key column is shared and counted once; without
-/// one, the store's own B-tree answers filters on the key column.
+/// one, or beside one that cannot serve, the store keeps its own B-tree.
 #[test]
 fn the_key_index_is_shared_or_owned() {
     let equality = SargableQuery::Equals(ScalarValue::Int32(Some(2)));
 
     let mut shared = IndexStore::new();
     shared.add_btree("id_idx".to_string(), 0, "id".to_string());
+    shared.add_btree("name_idx".to_string(), 1, "name".to_string());
     shared.enable_pk_index(&[("id".to_string(), 0)]);
-    shared.insert(&id_batch(&[1, 2, 3]), 0).unwrap();
+    shared
+        .insert(&id_name_vector_batch(&[(1, "a"), (2, "b"), (3, "c")]), 0)
+        .unwrap();
     assert_eq!(
         shared.resident_bytes(),
         shared.get_index("id_idx").unwrap().resident_bytes()
+            + shared.get_index("name_idx").unwrap().resident_bytes()
     );
+    // Rows reach every index while the key index reports rewrites.
+    assert_eq!(shared.get_btree("name_idx").unwrap().len(), 3);
 
     let mut owned = IndexStore::new();
     owned.enable_pk_index(&[("id".to_string(), 0)]);
@@ -1331,6 +1416,25 @@ fn the_key_index_is_shared_or_owned() {
         Vec::from(answer.as_filter().unwrap().at_most.clone()),
         vec![1]
     );
+
+    // A user index on the key column that cannot serve as the key index gets an
+    // owned one beside it, and still answers filters itself.
+    let mut beside = IndexStore::from_specs(
+        &[wrapped(
+            MemIndexSpec::btree("id_idx", 0, "id"),
+            Deviation::NotAKeyIndex,
+        )],
+        &test_lance_schema(),
+        64,
+        8,
+    )
+    .unwrap();
+    beside.enable_pk_index(&[("id".to_string(), 0)]);
+    beside.insert(&id_batch(&[1, 2, 2]), 0).unwrap();
+    assert!(beside.pk_has_overrides());
+    assert!(beside.resident_bytes() > beside.get_index("id_idx").unwrap().resident_bytes());
+    let found = beside.index_answering("id", &equality).unwrap();
+    assert!(Arc::ptr_eq(&found, beside.get_index("id_idx").unwrap()));
 }
 
 /// A key lookup with the wrong number of values finds nothing.
@@ -1436,6 +1540,33 @@ fn a_failed_index_leaves_the_batches_unindexed(#[case] rows_per_batch: usize) {
         .unwrap_err();
     assert!(error.to_string().contains("missing"), "{error}");
     assert_eq!(store.indexed_count(), 0);
+}
+
+/// An index that panics on its own thread fails the write, naming it.
+#[test]
+fn a_panicking_index_fails_the_write() {
+    let store = IndexStore::from_specs(
+        &[
+            MemIndexSpec::btree("id_idx", 0, "id"),
+            wrapped(
+                MemIndexSpec::btree("name_idx", 1, "name"),
+                Deviation::PanicsOnInsert,
+            ),
+        ],
+        &test_lance_schema(),
+        PARALLEL_INDEX_MIN_ROWS * 4,
+        8,
+    )
+    .unwrap();
+    let error = store
+        .insert_batches(&three_batches(PARALLEL_INDEX_MIN_ROWS + 64))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("'name_idx' panicked: insert panicked"),
+        "{error}"
+    );
 }
 
 /// The store's own key index, single-column or composite, takes every row and

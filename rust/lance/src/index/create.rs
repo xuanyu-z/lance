@@ -69,7 +69,7 @@ fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexP
     Ok(serde_json::from_value(provided)?)
 }
 
-fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
+pub fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
     Ok(ScalarIndexParams::new("inverted".to_string()).with_params(&params.to_training_json()?))
 }
 

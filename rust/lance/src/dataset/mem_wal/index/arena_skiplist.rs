@@ -51,13 +51,8 @@ const MAX_HEIGHT: usize = 16;
 /// Inverse promotion probability (p = 1/4): a node grows one level with prob
 /// 1/4. Matches RocksDB's default `kBranching`.
 const BRANCHING: u64 = 4;
-/// Largest bump-arena chunk (1 MiB). Nodes are packed contiguously within one.
-const MAX_CHUNK_SIZE: usize = 1 << 20;
-/// First chunk (4 KiB), doubling up to [`MAX_CHUNK_SIZE`], so an index holding
-/// few nodes is not charged a full chunk.
-const FIRST_CHUNK_SIZE: usize = 4 << 10;
-/// How many times the chunk size doubles before it reaches [`MAX_CHUNK_SIZE`].
-const CHUNK_DOUBLINGS: usize = (MAX_CHUNK_SIZE / FIRST_CHUNK_SIZE).trailing_zeros() as usize;
+/// Bump-arena chunk size (1 MiB). Nodes are packed contiguously within a chunk.
+const CHUNK_SIZE: usize = 1 << 20;
 
 /// Node header. The variable-length forward-pointer tower (`height` slots of
 /// `AtomicPtr<Node<K>>`) is laid out immediately after this header in the same
@@ -124,8 +119,7 @@ impl Arena {
     #[cold]
     unsafe fn grow(&mut self, layout: Layout, allocated: &AtomicUsize) {
         let align = layout.align().max(64);
-        let ramped = FIRST_CHUNK_SIZE << self.chunks.len().min(CHUNK_DOUBLINGS);
-        let size = ramped.max(layout.size().next_power_of_two());
+        let size = CHUNK_SIZE.max(layout.size().next_power_of_two());
         let chunk_layout = Layout::from_size_align(size, align).expect("valid chunk layout");
         let ptr = alloc::alloc(chunk_layout);
         if ptr.is_null() {
@@ -240,7 +234,7 @@ pub fn new_skiplist<K: Ord + Send + Sync>() -> (SkipListWriter<K>, SkipListReade
     (writer, reader)
 }
 
-/// The sole mutator of a skiplist: not `Clone`, and inserts take `&mut self`.
+/// The sole mutator of a skiplist. Not `Sync`: only one writer may exist.
 pub struct SkipListWriter<K> {
     core: Arc<SkipListCore<K>>,
     rng: u64,
@@ -358,9 +352,11 @@ pub struct SkipListReader<K> {
 impl<K: Ord> SkipListReader<K> {
     /// Bytes of arena chunks backing this skiplist's nodes.
     ///
-    /// Counts chunks, not entries, so it overshoots the live nodes by at most
-    /// one partly filled chunk. Excludes memory a key owns outside its node,
-    /// such as a long boxed key; the caller accounts for that.
+    /// Counts chunks, not entries, so it steps by `CHUNK_SIZE` and overshoots
+    /// the live nodes by at most one partly-filled chunk. Excludes any bytes a
+    /// key owns outside its node (e.g. a long `Box<[u8]>` key) — the arena
+    /// never sees those, so whoever built the key charges them; see
+    /// `BytesBackend::key_heap_bytes`.
     pub fn resident_bytes(&self) -> usize {
         self.core.arena_bytes.load(Ordering::Relaxed)
     }

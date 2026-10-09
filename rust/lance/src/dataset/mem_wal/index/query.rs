@@ -350,3 +350,47 @@ impl MemQuery for FtsMemQuery {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(positions: &[RowPosition]) -> PositionSet {
+        positions.iter().copied().collect()
+    }
+
+    /// Combining answers combines each bound, so a re-check still covers every
+    /// row the combination may match.
+    #[test]
+    fn answers_combine_bound_by_bound() {
+        let settled = MemSearchResult::exact(set(&[1, 2]));
+        let candidates = MemSearchResult::at_most(set(&[2, 3]));
+        assert_eq!(
+            settled.clone() & candidates.clone(),
+            MemSearchResult {
+                at_least: PositionSet::empty(),
+                at_most: set(&[2]),
+            }
+        );
+        assert_eq!(
+            settled | candidates,
+            MemSearchResult {
+                at_least: set(&[1, 2]),
+                at_most: set(&[1, 2, 3]),
+            }
+        );
+        assert!(MemSearchResult::empty().is_exact());
+    }
+
+    /// Truncating drops the hidden rows from both bounds, and the last position
+    /// hides nothing.
+    #[test]
+    fn truncating_keeps_only_the_visible_rows() {
+        let answer = MemSearchResult::exact(set(&[0, 5, u64::MAX]));
+        assert_eq!(
+            answer.clone().truncate_to(4),
+            MemSearchResult::exact(set(&[0]))
+        );
+        assert_eq!(answer.clone().truncate_to(u64::MAX), answer);
+    }
+}

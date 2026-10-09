@@ -703,6 +703,13 @@ impl MemTableFlusher {
                     continue;
                 }
                 FlushOutcome::Wrote(index_meta) => {
+                    // Queries find a generation's index by name and field.
+                    if index_meta.name != spec.name || index_meta.fields != spec.field_ids {
+                        return Err(Error::internal(format!(
+                            "index '{}' on fields {:?} recorded its file as '{}' on fields {:?}",
+                            spec.name, spec.field_ids, index_meta.name, index_meta.fields
+                        )));
+                    }
                     created.push(*index_meta);
                     continue;
                 }
@@ -837,7 +844,7 @@ async fn build_scalar_index(
         )));
     }
     let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
-    let params = spec.plugin.flush_params(spec);
+    let params = spec.plugin.flush_params(spec)?;
     let mut builder =
         CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
     if let Some(stream) = training_data {
@@ -850,6 +857,7 @@ async fn build_scalar_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
@@ -2024,10 +2032,30 @@ mod tests {
     /// Flush one memtable holding `batch`, maintaining `spec`, and return the
     /// indexes the generation records.
     async fn flush_one(spec: MemIndexSpec, batch: RecordBatch) -> Result<Vec<IndexMetadata>> {
-        use crate::dataset::mem_wal::index::IndexStore;
         use crate::index::DatasetIndexExt;
 
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let (generation, _dir) = flush_generation(spec, batch).await?;
+        Ok(generation.load_indices().await?.as_ref().clone())
+    }
+
+    /// The generation written by flushing `batch` with the index `spec`, and the
+    /// directory holding it.
+    async fn flush_generation(
+        spec: MemIndexSpec,
+        batch: RecordBatch,
+    ) -> Result<(Dataset, TempDir)> {
+        flush_generation_redefined(spec.clone(), spec, batch).await
+    }
+
+    /// [`flush_generation`], the index held as `held` and flushed as `flushed`.
+    async fn flush_generation_redefined(
+        held: MemIndexSpec,
+        flushed: MemIndexSpec,
+        batch: RecordBatch,
+    ) -> Result<(Dataset, TempDir)> {
+        use crate::dataset::mem_wal::index::IndexStore;
+
+        let (store, base_path, base_uri, temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
@@ -2036,15 +2064,14 @@ mod tests {
             2,
         ));
         let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
-        let specs = vec![spec];
         let lance_schema =
             lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
         let mut memtable = MemTable::new(batch.schema(), 1, vec![]).unwrap();
-        memtable.set_indexes(IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap());
+        memtable.set_indexes(IndexStore::from_specs(&[held], &lance_schema, 1000, 16).unwrap());
         let durable = memtable.insert(batch).await.unwrap() + 1;
         let result =
             MemTableFlusher::new(store, base_path, base_uri.clone(), shard_id, manifest_store)
-                .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+                .flush_with_indexes(&memtable, epoch, &[flushed], 1, durable)
                 .await?;
         let generation = Dataset::open(&format!(
             "{}/_mem_wal/{}/{}",
@@ -2053,7 +2080,7 @@ mod tests {
             result.sstable.path
         ))
         .await?;
-        Ok(generation.load_indices().await?.as_ref().clone())
+        Ok((generation, temp_dir))
     }
 
     /// An index holding nothing writes no index: an empty list-element
@@ -2091,7 +2118,6 @@ mod tests {
     /// refused by name.
     #[tokio::test]
     async fn a_vector_plugin_asking_the_flush_to_build_it_is_an_error() {
-        use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_linalg::distance::DistanceType;
 
@@ -2124,6 +2150,88 @@ mod tests {
             error.to_string().contains("vector_hnsw") && error.to_string().contains("Wrote"),
             "{error}"
         );
+    }
+
+    fn text_batch(texts: &[&str]) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..texts.len() as i32)),
+                Arc::new(StringArray::from(texts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A failed index flush fails the generation, and an index recorded under
+    /// a name or fields other than its own is refused.
+    #[rstest::rstest]
+    #[case::fails(Deviation::FailsToFlush, "flush failed")]
+    #[case::another_name(Deviation::RecordsAnotherName, "another_name")]
+    #[tokio::test]
+    async fn an_index_that_does_not_flush_as_itself_fails_the_flush(
+        #[case] deviation: Deviation,
+        #[case] message: &str,
+    ) {
+        let spec = wrapped(MemIndexSpec::fts("text_fts", 1, "text"), deviation);
+        let error = flush_one(spec, text_batch(&["hello world"]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    /// A flushed full-text index with word positions answers a phrase query,
+    /// whether the memtable held it with those settings or the flush rebuilt it
+    /// from the generation's rows.
+    #[rstest::rstest]
+    #[case::held(true)]
+    #[case::rebuilt(false)]
+    #[tokio::test]
+    async fn a_full_text_index_with_positions_answers_phrases_once_flushed(#[case] held: bool) {
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::InvertedIndexParams;
+        use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+
+        let spec = MemIndexSpec::fts_with_params(
+            "text_fts",
+            1,
+            "text",
+            InvertedIndexParams::default().with_position(true),
+        );
+        let held_spec = if held {
+            spec.clone()
+        } else {
+            MemIndexSpec::fts("text_fts", 1, "text")
+        };
+        let (generation, _dir) = flush_generation_redefined(
+            held_spec,
+            spec,
+            text_batch(&["quick brown fox", "brown quick"]),
+        )
+        .await
+        .unwrap();
+        let found = generation
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+                PhraseQuery::new("quick brown".to_string()).with_column(Some("text".to_string())),
+            )))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = found
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![0]);
     }
 
     /// After the index set changes, a flush builds from the memtable only an
@@ -2232,7 +2340,8 @@ mod tests {
             Deviation::AsksForABuild,
             Some(params),
         );
-        assert!(flush_one(spec, batch.clone()).await.is_err());
+        let error = flush_one(spec, batch.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("not a number"), "{error}");
 
         let spec = wrapped_with_flush_params(
             MemIndexSpec::btree("id_btree", 0, "id"),

@@ -726,7 +726,7 @@ impl ExecutionPlan for FtsIndexExec {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
-            column_statistics: vec![],
+            column_statistics: Statistics::unknown_column(&self.schema()),
         }))
     }
 
@@ -747,7 +747,7 @@ impl ExecutionPlan for FtsIndexExec {
 /// accepted while planning.
 fn declined(column: &str) -> Error {
     Error::internal(format!(
-        "the full-text index on '{column}' declined a search it accepted while planning"
+        "the full-text index on '{column}' accepted a search, then did not answer it"
     ))
 }
 

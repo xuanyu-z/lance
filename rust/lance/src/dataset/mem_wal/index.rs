@@ -18,7 +18,7 @@ pub(crate) mod test_plugin;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -33,7 +33,7 @@ use tracing::instrument;
 
 use super::memtable::batch_store::StoredBatch;
 use super::wal::WriterCursors;
-use pk::PkIndex;
+use pk::{OwnedPk, PkIndex};
 
 pub use btree::{BTreeMemIndex, BTreeMemIndexPlugin};
 pub use filter::{MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter};
@@ -84,7 +84,11 @@ pub fn validate_index_specs(
     lance_schema: &LanceSchema,
     pk_columns: &[String],
 ) -> Result<()> {
+    let mut seen = HashMap::new();
     for spec in specs {
+        if !first_under_its_name(&mut seen, spec)? {
+            continue;
+        }
         spec.validate(lance_schema)?;
     }
     for column in pk_columns {
@@ -103,6 +107,22 @@ pub fn validate_index_specs(
         }
     }
     Ok(())
+}
+
+/// Whether `spec` is the first under its name. A name listed again for the same
+/// index is that one index; for a different one it is refused.
+fn first_under_its_name<'a>(
+    seen: &mut HashMap<&'a str, &'a MemIndexSpec>,
+    spec: &'a MemIndexSpec,
+) -> Result<bool> {
+    match seen.insert(spec.name.as_str(), spec) {
+        None => Ok(true),
+        Some(first) if first.same_index(spec) => Ok(false),
+        Some(_) => Err(Error::invalid_input(format!(
+            "index '{}' is configured twice, as two different indexes",
+            spec.name
+        ))),
+    }
 }
 
 /// The error for an index no registered plugin maintains, naming the index.
@@ -229,12 +249,10 @@ impl IndexStore {
         max_batches: usize,
     ) -> Result<Self> {
         let mut store = Self::new();
+        let mut seen = HashMap::new();
         for spec in specs {
-            if store.indexes.contains_key(&spec.name) {
-                return Err(Error::invalid_input(format!(
-                    "index '{}' is configured twice",
-                    spec.name
-                )));
+            if !first_under_its_name(&mut seen, spec)? {
+                continue;
             }
             store.add_index(
                 spec.name.clone(),
@@ -357,13 +375,11 @@ impl IndexStore {
             };
             tasks.push((name, task));
         }
-        if let Some(pk) = self.pk_index.as_ref().filter(|pk| pk.is_owned()) {
+        if let Some(pk) = self.pk_index.as_ref().and_then(PkIndex::owned) {
             tasks.push((
                 "primary key",
                 Box::new(move || {
-                    rows.each(|batch, row_offset| {
-                        pk.insert_owned(batch, row_offset, track_overrides)
-                    })
+                    rows.each(|batch, row_offset| pk.insert(batch, row_offset, track_overrides))
                 }),
             ));
         }
@@ -432,7 +448,9 @@ impl IndexStore {
     /// the memtable's own key index last.
     pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
         let owned_pk = match &self.pk_index {
-            Some(PkIndex::Owned(index)) => Some(index.clone() as Arc<dyn MemIndex>),
+            Some(PkIndex::Owned(OwnedPk::Single(index))) => {
+                Some(index.clone() as Arc<dyn MemIndex>)
+            }
             _ => None,
         };
         self.indexes
@@ -482,8 +500,8 @@ impl IndexStore {
         let owned_pk = self
             .pk_index
             .as_ref()
-            .filter(|pk| pk.is_owned())
-            .map_or(0, |pk| pk.index().resident_bytes());
+            .and_then(PkIndex::owned)
+            .map_or(0, |pk| pk.btree().resident_bytes());
         named + owned_pk
     }
 
