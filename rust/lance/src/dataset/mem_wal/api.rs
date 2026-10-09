@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
+use lance_index::metrics::NoOpMetricsCollector;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -58,8 +59,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::index::{
-    MemIndexPlugin, MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type,
-    validate_index_specs,
+    MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type, validate_index_specs,
 };
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
@@ -159,10 +159,6 @@ pub struct InitializeMemWalBuilder<'a> {
     dataset: &'a mut Dataset,
     sharding: Sharding,
     maintained_indexes: Option<Vec<String>>,
-    /// The plugins to validate the maintained set against.
-    ///
-    /// A set is only maintainable by a writer that has the same plugins, so the
-    /// check here has to ask the same question the writer will.
     mem_index_registry: MemIndexRegistry,
     writer_config_defaults: HashMap<String, String>,
 }
@@ -226,10 +222,8 @@ impl<'a> InitializeMemWalBuilder<'a> {
         self
     }
 
-    /// Validate the maintained set against these plugins.
-    ///
-    /// Pass the same registry the writer will open with, or an index the writer
-    /// could maintain is rejected here.
+    /// Validate the maintained set against these plugins, the ones the writers
+    /// will open with.
     pub fn mem_index_registry(mut self, registry: MemIndexRegistry) -> Self {
         self.mem_index_registry = registry;
         self
@@ -805,36 +799,9 @@ impl DatasetMemWalExt for Dataset {
         shard_id: Uuid,
         mut config: ShardWriterConfig,
     ) -> Result<ShardWriter> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        // Load MemWalIndex to get maintained_indexes
-        let mem_wal_index = self
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                )
-            })?;
-
-        config.shard_spec_id =
-            resolve_writer_shard_spec_id(&mem_wal_index.details, config.shard_spec_id)?;
-
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
-
-        // The writer's per-index tuning reaches the plugins as opaque values,
-        // each recognising its own.
-        let overrides = writer_overrides(&config)?;
-        let index_specs = build_index_specs(
-            self,
-            &maintained_indexes,
-            &overrides,
-            &config.mem_index_registry,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+        let details = require_mem_wal_details(self).await?;
+        config.shard_spec_id = resolve_writer_shard_spec_id(&details, config.shard_spec_id)?;
+        let index_specs = maintained_index_specs(self, &details, &config).await?;
 
         // Set shard_id in config
         config.shard_id = shard_id;
@@ -867,30 +834,8 @@ impl DatasetMemWalExt for Dataset {
         &self,
         writer: &ShardWriter,
     ) -> Result<Option<SealFence>> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
-        let mem_wal_index = self
-            .open_mem_wal_index(&NoOpMetricsCollector)
-            .await?
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
-                )
-            })?;
-        let (maintained_indexes, on_unsupported) =
-            resolve_maintained_indexes(self, &mem_wal_index.details).await?;
-        // The writer's own plugins and tuning, so a refresh resolves the set the
-        // same way the open did.
-        let config = writer.config();
-        let index_specs = build_index_specs(
-            self,
-            &maintained_indexes,
-            &writer_overrides(config)?,
-            &config.mem_index_registry,
-            OnMissingIndex::Skip,
-            on_unsupported,
-        )
-        .await?;
+        let details = require_mem_wal_details(self).await?;
+        let index_specs = maintained_index_specs(self, &details, writer.config()).await?;
         writer.replace_index_configs(index_specs).await
     }
 }
@@ -907,6 +852,31 @@ enum OnUnsupportedIndex {
     Skip,
 }
 
+impl ShardWriter {
+    /// Moves this writer onto `dataset`'s current schema and maintained indexes.
+    ///
+    /// Pass the base table as read after the schema change. Returns `Ok(None)`
+    /// when the writer is already up to date.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::mem_wal::ShardWriter;
+    /// # async fn doc(writer: &ShardWriter, dataset: &Dataset) -> Result<()> {
+    /// writer.evolve_to(dataset).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<SealFence>> {
+        let details = require_mem_wal_details(dataset).await?;
+        let index_specs = maintained_index_specs(dataset, &details, self.config()).await?;
+        self.evolve_schema(
+            Arc::new(super::arrow_schema_with_field_ids(dataset.schema())),
+            index_specs,
+        )
+        .await
+    }
+}
+
 /// Whether an index the set names but the dataset does not have is fatal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OnMissingIndex {
@@ -918,6 +888,40 @@ enum OnMissingIndex {
     /// here would refuse every read on the table for something that costs only
     /// the fresh tier's copy of one index.
     Skip,
+}
+
+/// Loads the MemWAL index details, failing if MemWAL is not initialized.
+async fn require_mem_wal_details(dataset: &Dataset) -> Result<MemWalIndexDetails> {
+    let index = dataset
+        .open_mem_wal_index(&NoOpMetricsCollector)
+        .await?
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
+            )
+        })?;
+    Ok(index.details.clone())
+}
+
+/// The index specs a writer on `dataset` maintains, built with the writer's
+/// own plugins and settings.
+///
+/// Every path that gives a writer its indexes uses this, so they all agree.
+async fn maintained_index_specs(
+    dataset: &Dataset,
+    details: &MemWalIndexDetails,
+    config: &ShardWriterConfig,
+) -> Result<Vec<MemIndexSpec>> {
+    let (index_names, on_unsupported) = resolve_maintained_indexes(dataset, details).await?;
+    build_index_specs(
+        dataset,
+        &index_names,
+        &writer_overrides(config)?,
+        &config.mem_index_registry,
+        OnMissingIndex::Skip,
+        on_unsupported,
+    )
+    .await
 }
 
 /// The indexes a MemTable should carry, and how to treat one this writer cannot
@@ -949,11 +953,8 @@ async fn resolve_maintained_indexes(
     Ok((names, OnUnsupportedIndex::Skip))
 }
 
-/// The writer's per-index build settings, as the opaque values plugins read.
-///
-/// HNSW settings are typed on the config so a caller sets them without
-/// reaching for `Any`; every other plugin's arrive through
-/// `index_overrides`. One index named in both is ambiguous.
+/// The writer's per-index settings, as the values plugins read. Naming one
+/// index in both `hnsw_params` and `index_overrides` is an error.
 fn writer_overrides(
     config: &ShardWriterConfig,
 ) -> Result<HashMap<String, Arc<dyn Any + Send + Sync>>> {
@@ -982,10 +983,8 @@ async fn build_index_specs(
     on_missing: OnMissingIndex,
     on_unsupported: OnUnsupportedIndex,
 ) -> Result<Vec<MemIndexSpec>> {
-    // The shard schema is base + `_tombstone`, as `ShardWriter::open` extends
-    // it; a nested path resolves against that, not the base. Field ids come
-    // stamped, so a spec's ids are the dataset's own — the same ones the
-    // writer's schema carries, which its own validation checks them against.
+    // The shard schema is the base schema plus `_tombstone`, as
+    // `ShardWriter::open` extends it.
     let base_schema = super::arrow_schema_with_field_ids(dataset.schema());
     let shard_arrow = schema_with_tombstone(&base_schema);
     let shard_schema = LanceSchema::try_from(shard_arrow.as_ref())?;
@@ -1048,29 +1047,63 @@ async fn build_index_specs(
             return Err(unsupported_index_type(index_name, type_url, registry));
         };
 
-        let spec = match spec_for_index(
-            dataset,
-            index_name,
-            &index_meta,
-            plugin,
-            &shard_schema,
-            overrides,
-        )
-        .await?
+        let columns = match index_meta
+            .fields
+            .iter()
+            .map(|field_id| column_path(dataset.schema(), index_name, *field_id))
+            .collect::<Result<Vec<_>>>()
         {
-            Ok(spec) => spec,
-            // As below: an index nobody named must not make the table
-            // unwritable because its columns cannot be resolved.
-            Err(error) if on_unsupported == OnUnsupportedIndex::Skip => {
-                log::warn!(
-                    "index '{}' is not one the fresh tier can maintain ({}); \
-                     it will not be maintained",
-                    index_name,
-                    error
-                );
+            Ok(columns) => columns,
+            Err(error) => {
+                skip_or_fail(on_unsupported, index_name, error)?;
                 continue;
             }
-            Err(error) => return Err(error),
+        };
+
+        let resolved = plugin
+            .resolve(&ResolveContext {
+                name: index_name,
+                dataset,
+                index_meta: &index_meta,
+                schema: &shard_schema,
+                columns: &columns,
+                overrides: overrides.get(index_name).map(|o| o.as_ref()),
+            })
+            .await?;
+
+        let field_ids =
+            match resolved.field_ids {
+                // The index's own columns keep its own field ids.
+                None if resolved.columns == columns => Ok(index_meta.fields.clone()),
+                None => resolved
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        shard_schema.field(column).map(|field| field.id).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "index '{index_name}' resolved to column '{column}', which is not \
+                             in the shard schema"
+                        ))
+                    })
+                    })
+                    .collect::<Result<Vec<_>>>(),
+                Some(field_ids) => Ok(field_ids),
+            };
+        let field_ids = match field_ids {
+            Ok(field_ids) => field_ids,
+            Err(error) => {
+                skip_or_fail(on_unsupported, index_name, error)?;
+                continue;
+            }
+        };
+
+        let spec = MemIndexSpec {
+            name: index_name.clone(),
+            field_ids,
+            columns: resolved.columns,
+            plugin,
+            params: resolved.params,
+            details: index_meta.index_details.clone(),
         };
 
         // Nobody named this one, so a table must not become unwritable for
@@ -1083,12 +1116,7 @@ async fn build_index_specs(
                 &shard_pk_columns,
             )
         {
-            log::warn!(
-                "index '{}' is not one the fresh tier can maintain ({}); \
-                 it will not be maintained",
-                index_name,
-                error
-            );
+            skip_or_fail(on_unsupported, index_name, error)?;
             continue;
         }
         index_specs.push(spec);
@@ -1096,83 +1124,17 @@ async fn build_index_specs(
     Ok(index_specs)
 }
 
-/// The spec for one base-table index that `plugin` maintains.
-///
-/// The inner error is an index whose columns cannot be resolved against the
-/// shard schema; the outer one is anything else, such as settings the plugin
-/// refuses.
-async fn spec_for_index(
-    dataset: &Dataset,
-    index_name: &str,
-    index_meta: &lance_table::format::IndexMetadata,
-    plugin: Arc<dyn MemIndexPlugin>,
-    shard_schema: &LanceSchema,
-    overrides: &HashMap<String, Arc<dyn Any + Send + Sync>>,
-) -> Result<Result<MemIndexSpec>> {
-    let columns = match index_meta
-        .fields
-        .iter()
-        .map(|field_id| column_path(dataset.schema(), index_name, *field_id))
-        .collect::<Result<Vec<_>>>()
-    {
-        Ok(columns) => columns,
-        Err(error) => return Ok(Err(error)),
-    };
-
-    // The plugin decides what it covers and what it needs; nothing here
-    // knows one kind from another.
-    let resolved = plugin
-        .resolve(&ResolveContext {
-            name: index_name,
-            dataset,
-            index_meta,
-            schema: shard_schema,
-            columns: &columns,
-            overrides: overrides.get(index_name).map(|o| o.as_ref()),
-        })
-        .await?;
-
-    let field_ids = match resolved.field_ids {
-        // The base-table index's own columns: its own field ids, so a
-        // lookup by name can never land on a different field.
-        None if resolved.columns == columns => Ok(index_meta.fields.clone()),
-        Some(field_ids) if field_ids.len() == resolved.columns.len() => Ok(field_ids),
-        Some(field_ids) => {
-            return Err(Error::invalid_input(format!(
-                "index '{index_name}' resolved {} columns but {} field ids",
-                resolved.columns.len(),
-                field_ids.len()
-            )));
-        }
-        None => resolved
-            .columns
-            .iter()
-            .map(|column| {
-                shard_schema
-                    .field(column)
-                    .map(|field| field.id)
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "index '{index_name}' resolved to column '{column}', which is not in \
-                         the shard schema"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>>>(),
-    };
-    let field_ids = match field_ids {
-        Ok(field_ids) => field_ids,
-        Err(error) => return Ok(Err(error)),
-    };
-
-    Ok(Ok(MemIndexSpec {
-        name: index_name.to_string(),
-        field_ids,
-        columns: resolved.columns,
-        plugin,
-        params: resolved.params,
-        details: index_meta.index_details.clone(),
-    }))
+/// Under maintain-all, skip an index the writer cannot build so the table stays
+/// writable; otherwise refuse it.
+fn skip_or_fail(on_unsupported: OnUnsupportedIndex, index_name: &str, error: Error) -> Result<()> {
+    if on_unsupported == OnUnsupportedIndex::Reject {
+        return Err(error);
+    }
+    log::warn!(
+        "index '{index_name}' is not one the fresh tier can maintain ({error}); it will not be \
+         maintained"
+    );
+    Ok(())
 }
 
 /// The path a query uses for field `field_id`: its name at the top level, and
@@ -1194,8 +1156,8 @@ fn column_path(schema: &LanceSchema, index_name: &str, field_id: i32) -> Result<
 /// Applies the same rules [`ShardWriter::open`] does, so a set that passes here
 /// is a set the writer can open. [`InitializeMemWalBuilder::execute`] runs it
 /// before committing; it is public so a caller inferring a set can ask the same
-/// question first. A type url alone cannot decide this — every vector sub-type
-/// maps to the one HNSW plugin, which needs a `FixedSizeList<Float32>` column.
+/// question first. A type url alone cannot decide this: a plugin also checks
+/// the column, as HNSW needs a `FixedSizeList<Float32>` one.
 ///
 /// All-or-nothing: it reports the first index it cannot maintain rather than
 /// returning a usable subset, so a caller inferring a set surfaces the error
@@ -1203,23 +1165,19 @@ fn column_path(schema: &LanceSchema, index_name: &str, field_id: i32) -> Result<
 ///
 /// Judges `dataset` as given; see the module-level limitations.
 ///
-/// Opens each vector index to inherit its distance type.
+/// A plugin may read the base index while resolving it.
 pub async fn validate_maintained_indexes(dataset: &Dataset, index_names: &[String]) -> Result<()> {
     validate_maintained_indexes_with(dataset, index_names, &MemIndexRegistry::default()).await
 }
 
-/// As [`validate_maintained_indexes`], but asking a specific set of plugins.
-///
-/// A caller that will open its writer with plugins registered must validate
-/// against the same set, or validation would reject an index the writer can in
-/// fact maintain.
+/// [`validate_maintained_indexes`] against `registry`, the plugins the writers
+/// will open with.
 pub async fn validate_maintained_indexes_with(
     dataset: &Dataset,
     index_names: &[String],
     registry: &MemIndexRegistry,
 ) -> Result<()> {
-    // Validation reads an index's name, column, and field id, never its HNSW
-    // tuning, so the writer's build params are not needed here.
+    // Validation does not depend on a writer's settings.
     let index_specs = build_index_specs(
         dataset,
         index_names,
@@ -2012,12 +1970,9 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    /// A full-text index on a field inside a list of structs is a valid base
-    /// table index, so the memtable must be able to maintain it. Its path runs
-    /// through list elements a schema lookup by name does not follow, which is
-    /// why the plugin, not a generic walk, says which field it covers.
+    /// A full-text index on a field inside a list of structs is maintained.
     #[tokio::test]
-    async fn a_full_text_index_inside_a_list_can_be_maintained() {
+    async fn test_a_full_text_index_inside_a_list_can_be_maintained() {
         let children = arrow_schema::Fields::from(vec![Field::new("name", DataType::Utf8, true)]);
         let values = StructArray::new(
             children.clone(),
@@ -2058,8 +2013,120 @@ mod tests {
             .unwrap();
     }
 
+    /// Maintaining every index skips one on a nested field, so the table stays
+    /// writable, and a same-named top-level field's index keeps its own field
+    /// id.
+    #[rstest]
+    #[case::nested_only(false)]
+    #[case::beside_a_top_level_namesake(true)]
+    #[tokio::test]
+    async fn test_maintain_all_skips_a_nested_index(#[case] with_top_level_code: bool) {
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().display());
+        let attrs_fields = Fields::from(vec![Field::new("code", DataType::Int32, true)]);
+        let mut fields = vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("attrs", DataType::Struct(attrs_fields.clone()), true),
+        ];
+        if with_top_level_code {
+            fields.push(Field::new("code", DataType::Int32, true));
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let rows = |ids: std::ops::Range<i32>| {
+            let attrs = StructArray::new(
+                attrs_fields.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    ids.clone().map(|i| i % 7),
+                ))],
+                Some(ids.clone().map(|i| i % 3 != 0).collect()),
+            );
+            let mut columns: Vec<arrow_array::ArrayRef> = vec![
+                Arc::new(Int32Array::from_iter_values(ids.clone())),
+                Arc::new(attrs),
+            ];
+            if with_top_level_code {
+                columns.push(Arc::new(Int32Array::from_iter_values(ids.map(|i| i % 5))));
+            }
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(rows(0..30))], schema.clone()),
+            &uri,
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+        let mut indexes = vec![("attrs.code", "nested_code_btree")];
+        if with_top_level_code {
+            indexes.push(("code", "code_btree"));
+        }
+        for (column, name) in &indexes {
+            dataset
+                .create_index(
+                    &[*column],
+                    IndexType::BTree,
+                    Some(name.to_string()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let expected: Vec<String> = if with_top_level_code {
+            vec!["code_btree".to_string()]
+        } else {
+            Vec::new()
+        };
+        let shard_id = Uuid::new_v4();
+        // Closing flushes the memtable, so the second round reopens over it.
+        for round in 0..2 {
+            let writer = dataset
+                .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.maintained_index_names().await,
+                expected,
+                "round {round}"
+            );
+            writer
+                .put(vec![rows(100 * (round + 1)..100 * (round + 1) + 20)])
+                .await
+                .unwrap();
+            writer.close().await.unwrap();
+        }
+        if with_top_level_code {
+            let specs = maintained_index_specs(
+                &dataset,
+                &require_mem_wal_details(&dataset).await.unwrap(),
+                &ShardWriterConfig::new(shard_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].columns, vec!["code".to_string()]);
+            assert_eq!(
+                specs[0].field_ids,
+                vec![dataset.schema().field("code").unwrap().id],
+                "bound to the top-level field, not the nested one of the same name"
+            );
+        }
+    }
+
+    use super::super::index::BTreeMemIndexPlugin;
+
     /// Claims a kind no built-in plugin maintains (the base table's zone map)
-    /// and maintains it as a B-tree.
+    /// and maintains and flushes it as a B-tree.
     #[derive(Debug)]
     struct UnclaimedKindAsBTree;
 
@@ -2072,27 +2139,20 @@ mod tests {
             "ZoneMapIndexDetails"
         }
         fn flush_index_type(&self) -> IndexType {
-            IndexType::ZoneMap
+            IndexType::BTree
         }
         fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
-            btree_plugin().training_criteria()
+            BTreeMemIndexPlugin.training_criteria()
         }
         fn validate(&self, ctx: &super::super::index::MemIndexBuildContext<'_>) -> Result<()> {
-            btree_plugin().validate(ctx)
+            BTreeMemIndexPlugin.validate(ctx)
         }
         fn create(
             &self,
             ctx: &super::super::index::MemIndexBuildContext<'_>,
         ) -> Result<Arc<dyn super::super::index::MemIndex>> {
-            btree_plugin().create(ctx)
+            BTreeMemIndexPlugin.create(ctx)
         }
-    }
-
-    fn btree_plugin() -> Arc<dyn super::super::index::MemIndexPlugin> {
-        MemIndexRegistry::default()
-            .plugin_for_details_url("/lance.table.BTreeIndexDetails")
-            .unwrap()
-            .clone()
     }
 
     async fn id_v_dataset_with_zone_map_and_btree(uri: &str) -> Dataset {
@@ -2115,8 +2175,7 @@ mod tests {
         dataset
     }
 
-    /// Maintaining every index, one of a kind no plugin claims is skipped and
-    /// the rest are maintained.
+    /// Maintaining every index skips one no plugin claims.
     #[tokio::test]
     async fn test_maintain_all_skips_an_index_no_plugin_claims() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2133,130 +2192,14 @@ mod tests {
             .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
             .await
             .unwrap();
-        assert_eq!(writer.maintained_index_names(), vec!["v_btree".to_string()]);
+        assert_eq!(
+            writer.maintained_index_names().await,
+            vec!["v_btree".to_string()]
+        );
         writer.close().await.unwrap();
     }
 
-    /// An index on a nested field is skipped when maintaining every index, so
-    /// the table stays writable, and a top-level field sharing the nested
-    /// field's name keeps its own index under its own field id.
-    #[tokio::test]
-    async fn test_maintain_all_skips_a_nested_index_and_keeps_a_same_named_top_level_one() {
-        use arrow_array::StructArray;
-        use arrow_schema::Fields;
-
-        for with_top_level_code in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            let uri = format!("{}/base", tmp.path().display());
-            let attrs_fields = Fields::from(vec![Field::new("code", DataType::Int32, true)]);
-            let mut fields = vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("attrs", DataType::Struct(attrs_fields.clone()), true),
-            ];
-            if with_top_level_code {
-                fields.push(Field::new("code", DataType::Int32, true));
-            }
-            let schema = Arc::new(ArrowSchema::new(fields));
-            let rows = |ids: std::ops::Range<i32>| {
-                let n = ids.len();
-                let attrs = StructArray::new(
-                    attrs_fields.clone(),
-                    vec![Arc::new(Int32Array::from_iter_values(
-                        ids.clone().map(|i| i % 7),
-                    ))],
-                    // Every third row's struct is null.
-                    Some(ids.clone().map(|i| i % 3 != 0).collect()),
-                );
-                let mut columns: Vec<arrow_array::ArrayRef> = vec![
-                    Arc::new(Int32Array::from_iter_values(ids.clone())),
-                    Arc::new(attrs),
-                ];
-                if with_top_level_code {
-                    columns.push(Arc::new(Int32Array::from_iter_values(ids.map(|i| i % 5))));
-                }
-                assert_eq!(columns[0].len(), n);
-                RecordBatch::try_new(schema.clone(), columns).unwrap()
-            };
-            let mut dataset = Dataset::write(
-                RecordBatchIterator::new([Ok(rows(0..30))], schema.clone()),
-                &uri,
-                Some(WriteParams::default()),
-            )
-            .await
-            .unwrap();
-            let mut indexes = vec![("attrs.code", "nested_code_btree")];
-            if with_top_level_code {
-                indexes.push(("code", "code_btree"));
-            }
-            for (column, name) in &indexes {
-                dataset
-                    .create_index(
-                        &[*column],
-                        IndexType::BTree,
-                        Some(name.to_string()),
-                        &ScalarIndexParams::default(),
-                        true,
-                    )
-                    .await
-                    .unwrap();
-            }
-            dataset
-                .initialize_mem_wal()
-                .unsharded()
-                .execute()
-                .await
-                .unwrap();
-
-            let expected: Vec<String> = if with_top_level_code {
-                vec!["code_btree".to_string()]
-            } else {
-                Vec::new()
-            };
-            let shard_id = Uuid::new_v4();
-            for round in 0..2 {
-                let writer = dataset
-                    .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    writer.maintained_index_names(),
-                    expected,
-                    "top-level code: {with_top_level_code}, round {round}"
-                );
-                writer
-                    .put(vec![rows(100 * (round + 1)..100 * (round + 1) + 20)])
-                    .await
-                    .unwrap();
-                // Closing flushes the memtable, and the next round reopens the
-                // shard over what it wrote.
-                writer.close().await.unwrap();
-            }
-            if with_top_level_code {
-                let lance_schema = dataset.schema();
-                let spec = build_index_specs(
-                    &dataset,
-                    &["code_btree".to_string()],
-                    &HashMap::new(),
-                    &MemIndexRegistry::default(),
-                    OnMissingIndex::Reject,
-                    OnUnsupportedIndex::Reject,
-                )
-                .await
-                .unwrap();
-                assert_eq!(spec.len(), 1);
-                assert_eq!(spec[0].columns, vec!["code".to_string()]);
-                assert_eq!(
-                    spec[0].field_ids,
-                    vec![lance_schema.field("code").unwrap().id],
-                    "bound to the top-level field, not the nested one of the same name"
-                );
-            }
-        }
-    }
-
-    /// A named set is judged by the plugins the writers will have: refused when
-    /// no registered plugin claims an index, accepted and maintained once one
-    /// does.
+    /// A named set is refused until a registered plugin claims each index.
     #[tokio::test]
     async fn test_a_named_set_is_validated_against_the_writers_plugins() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2294,7 +2237,7 @@ mod tests {
             .unwrap();
         let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
         assert_eq!(
-            writer.maintained_index_names(),
+            writer.maintained_index_names().await,
             vec!["id_zone_map".to_string()]
         );
         writer.close().await.unwrap();
@@ -2340,8 +2283,7 @@ mod tests {
         assert!(error.to_string().contains(index), "{error}");
     }
 
-    /// One index named in both the HNSW settings and the generic ones is
-    /// ambiguous.
+    /// An index named in both `hnsw_params` and `index_overrides` is refused.
     #[tokio::test]
     async fn test_an_index_overridden_twice_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2356,8 +2298,7 @@ mod tests {
         assert!(error.to_string().contains("both"), "{error}");
     }
 
-    /// The generic channel carries the type a plugin reads: HNSW settings set
-    /// through it reach the writer exactly as through the typed field.
+    /// HNSW settings reach the plugin through `index_overrides`.
     #[tokio::test]
     async fn test_index_overrides_reach_the_plugin() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2367,7 +2308,7 @@ mod tests {
             .with_index_override("vector_idx", HnswBuildParams::default());
         let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
         assert_eq!(
-            writer.maintained_index_names(),
+            writer.maintained_index_names().await,
             vec!["vector_idx".to_string()]
         );
         writer.close().await.unwrap();

@@ -3,28 +3,13 @@
 
 //! How a filter expression reaches a memtable index.
 //!
-//! The memtable does not define a predicate vocabulary of its own. It hands the
-//! filter to [`apply_scalar_indices`], the same pass the base table's scan uses,
-//! with a provider built from the memtable's own indexes. What comes back is a
-//! tree of index searches and a leftover expression, and the tree's leaves are
-//! `AnyQuery` values the indexes answer directly.
+//! The filter goes through [`apply_scalar_indices`], the pass the base table's
+//! scan uses, with a provider built from the memtable's indexes and their
+//! plugins' [`ScalarQueryParser`]s. The result is a tree of index searches plus
+//! a leftover expression applied to the rows the indexes narrowed to.
 //!
-//! So the memtable's filter capability comes from the plugins' parsers rather
-//! than from code here:
-//!
-//! * Every expression shape a plugin's [`ScalarQueryParser`] claims — ranges
-//!   with either bound inclusive, `IN`, `IS NULL`, `LIKE 'prefix%'`, a spatial
-//!   or text function — reaches the memtable index, because it is literally the
-//!   parser the on-disk index uses.
-//! * `AND` and `OR` across different columns and different indexes compose.
-//! * What no index can answer comes back as the leftover expression and is
-//!   applied as an ordinary filter over the rows the indexes narrowed to.
-//!
-//! `NOT` is deliberately not evaluated here: complementing a result needs the
-//! rows whose value is null tracked separately, to keep SQL's three-valued
-//! logic, and the memtable's indexes do not report that yet. A filter with a
-//! `NOT` over an indexed leaf falls back to a scan rather than answering it
-//! wrongly.
+//! `NOT` is not evaluated from indexes: complementing a result needs each
+//! index's null rows, which they do not report, so such a filter is scanned.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,26 +28,18 @@ use super::query::{MemMatches, MemSearchResult, PositionSet, ScalarQuery, Search
 use super::{IndexStore, MemIndexSpec};
 
 /// The memtable's indexes, in the shape the expression pass expects.
-///
-/// Built once when a memtable is configured: the parsers come from the plugins,
-/// so a deployment's own index kind claims expressions here without Lance
-/// knowing it exists.
 #[derive(Debug, Default)]
 pub struct MemIndexCatalog {
     columns: HashMap<String, (DataType, MultiQueryParser)>,
 }
 
 impl MemIndexCatalog {
-    /// Collect the parsers for every spec that has one.
-    ///
-    /// A spec whose plugin returns no parser is simply absent here, which is
-    /// how a vector or full-text index stays out of filter planning.
+    /// The parsers of every spec whose plugin has one.
     pub fn new(specs: &[MemIndexSpec], schema: &LanceSchema) -> Self {
         let mut columns: HashMap<String, (DataType, MultiQueryParser)> = HashMap::new();
         for spec in specs {
             let details = spec.details.as_deref();
-            // A multi-column index claims expressions on each column it
-            // covers, and each column needs its own parser.
+            // Each covered column gets its own parser.
             for column in &spec.columns {
                 let Some(field) = schema.field(column) else {
                     continue;
@@ -71,8 +48,8 @@ impl MemIndexCatalog {
                     continue;
                 };
                 match columns.get_mut(column) {
-                    // Two indexes on one column: the first to claim an
-                    // expression answers it, which is what the base table does.
+                    // The first index on a column to claim an expression answers
+                    // it, as on the base table.
                     Some((_, existing)) => existing.add(parser),
                     None => {
                         columns.insert(
@@ -105,10 +82,8 @@ impl IndexInformationProvider for MemIndexCatalog {
     }
 }
 
-/// Split `filter` into index searches and whatever is left to evaluate.
-///
-/// `None` when no index can help, which is the caller's signal to plan an
-/// ordinary scan.
+/// Split `filter` into index searches and whatever is left to evaluate; `None`
+/// when no index can help.
 pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<IndexedExpression>> {
     if catalog.is_empty() {
         return Ok(None);
@@ -117,8 +92,7 @@ pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<In
     let Some(query) = &split.scalar_query else {
         return Ok(None);
     };
-    // A tree the memtable cannot evaluate is worse than no tree: it would have
-    // to scan anyway, and planning an index node first only adds a step.
+    // A tree the memtable cannot evaluate is planned as a scan.
     if !is_evaluable(query) {
         return Ok(None);
     }
@@ -128,11 +102,9 @@ pub fn plan_filter(filter: &Expr, catalog: &MemIndexCatalog) -> Result<Option<In
 /// `filter` with each cast of an indexed column removed when the cast changes
 /// only the column's nested field names or metadata.
 ///
-/// A memtable's schema carries Lance field ids on nested fields, so comparing a
-/// list column with a list literal coerces the column to the literal's type —
-/// a cast that leaves every value as it was, but hides the column from the
-/// parser that would otherwise claim the expression. The filter evaluated over
-/// the rows keeps its cast; only the index split looks through it.
+/// Field ids on a memtable's nested fields make comparing a list column with a
+/// list literal cast the column, which changes no value but hides the column
+/// from the parser. Only the index split looks through such a cast.
 fn see_through_relabelling(filter: &Expr, catalog: &MemIndexCatalog) -> Expr {
     filter
         .clone()
@@ -162,10 +134,6 @@ fn is_evaluable(expr: &ScalarIndexExpr) -> bool {
 }
 
 /// Evaluate a tree of index searches against one memtable.
-///
-/// The set algebra is elementwise on the two endpoints, so an exact leaf
-/// combined with a narrowing one yields a narrowing result, and the caller
-/// re-checks exactly when it has to.
 pub fn evaluate(
     expr: &ScalarIndexExpr,
     indexes: &IndexStore,
@@ -187,17 +155,15 @@ pub fn evaluate(
             match index.search(&ScalarQuery(search.query.as_ref()), ctx)? {
                 Some(MemMatches::Filter(result)) => {
                     let result = result.truncate_to(ctx.max_visible);
-                    // The index answered exactly, but the expression pass asked
-                    // for a re-check anyway — a parser says so when the query it
-                    // built is a widening of the expression it came from.
+                    // The parser asked for a re-check: its query widens the
+                    // expression.
                     Ok(if search.needs_recheck {
                         MemSearchResult::at_most(result.at_most)
                     } else {
                         result
                     })
                 }
-                // A ranked answer to a filter, or no answer at all: this index
-                // cannot narrow the search, so nothing is ruled out.
+                // A ranked answer or none: nothing is ruled out.
                 Some(MemMatches::Ranked(_)) | None => Ok(unknown(ctx)),
             }
         }
@@ -226,9 +192,8 @@ mod tests {
 
     use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
 
-    /// A list column whose nested field carries a field id is cast to a list
-    /// literal's type when compared with one. The cast changes no value, so a
-    /// label-list parser must still claim the comparison.
+    /// A label-list parser claims a list comparison despite the cast field ids
+    /// add.
     #[test]
     fn an_index_sees_through_a_cast_that_only_relabels_nested_fields() {
         use lance_index::scalar::expression::LabelListQueryParser;
@@ -280,8 +245,7 @@ mod tests {
     }
 
     /// Two B-trees, on `id` and `name`, over ten rows: `id` counts up and
-    /// `name` is `alpha<id>`. No underscore in the names, because `_` is a
-    /// LIKE wildcard and would make the prefix case test something else.
+    /// `name` is `alpha<id>`, with no `_`, which `LIKE` treats as a wildcard.
     fn store() -> (IndexStore, Vec<MemIndexSpec>) {
         let arrow = schema();
         let lance = LanceSchema::try_from(arrow.as_ref()).unwrap();
@@ -345,8 +309,7 @@ mod tests {
         }
     }
 
-    /// `AND` and `OR` across two different indexes compose. The memtable used
-    /// to take one predicate on one column and scan for anything else.
+    /// `AND` and `OR` across two indexes compose.
     #[test]
     fn compound_filters_combine_two_indexes() {
         let (positions, exact) = run("id >= 4 AND name = 'alpha5'");
@@ -358,9 +321,8 @@ mod tests {
         assert!(exact);
     }
 
-    /// A conjunct no index covers is not a reason to give up the ones that are
-    /// covered: the indexed half narrows, and the rest comes back as the
-    /// expression to apply afterwards.
+    /// An unindexed conjunct comes back as the leftover; the indexed one still
+    /// narrows.
     #[test]
     fn an_unindexed_conjunct_becomes_the_leftover_expression() {
         let (_, specs) = store();
@@ -383,19 +345,14 @@ mod tests {
         assert!(plan("other = 1", &specs).is_none());
     }
 
-    /// Complementing a result needs the rows whose value is null tracked
-    /// separately, to keep SQL's three-valued logic. Until an index reports
-    /// that, answering `NOT` from the index would drop or admit null rows, so
-    /// the whole filter falls back to a scan.
+    /// A filter with `NOT` over an indexed leaf is scanned.
     #[test]
     fn a_negated_filter_declines_rather_than_answering_wrongly() {
         let (_, specs) = store();
         assert!(plan("NOT (id = 5)", &specs).is_none());
     }
 
-    /// Planning runs on the optimized expression, so a float zero reaches the
-    /// index as the two-element set IEEE 754 says it is rather than as one
-    /// bit-exact key — the same answer the full scan beside it gives.
+    /// A float zero reaches the index as both zeros, as the full scan reads it.
     #[test]
     fn planning_sees_the_optimized_expression() {
         let arrow = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -434,8 +391,7 @@ mod tests {
         }
     }
 
-    /// An index holds rows a reader must not see yet, because a writer runs
-    /// ahead of the watermark that publishes them.
+    /// Positions past the visibility watermark are not returned.
     #[test]
     fn evaluation_honors_the_visibility_watermark() {
         let (store, specs) = store();
@@ -445,8 +401,7 @@ mod tests {
         assert_eq!(positions, vec![0, 1, 2, 3, 4]);
     }
 
-    /// An index the tree names but the store does not hold rules nothing out,
-    /// rather than answering "no rows" and dropping every match.
+    /// An index the tree names but the store does not hold rules nothing out.
     #[test]
     fn a_missing_index_rules_nothing_out() {
         let (store, _) = store();

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! `ScalarIndexExec` — scalar-index queries over a memtable, with MVCC visibility.
-//!
-//! Serves the built-in B-tree and any index a registered plugin maintains: the
-//! predicate resolves to row positions, and everything after that — position to
-//! batch, projection, row id and row address — is the same work either way.
+//! `ScalarIndexExec`: a filter answered from a memtable's indexes, with MVCC
+//! visibility.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -38,22 +35,16 @@ use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
-/// The share of visible rows past which an index answer is not worth listing:
-/// an index may decline a search matching more than `1 / MATCH_BUDGET_SHARE` of
-/// them, and every row is read instead. On 100,000 in-memory rows a B-tree
-/// range lists its matches at about 8 ns each, while reading every row and
-/// applying the filter takes about 135 µs whatever matches; the two cross near
-/// 7% of the rows.
+/// An index may decline a search matching more than `1 / MATCH_BUDGET_SHARE`
+/// of the visible rows, which are then all read, since listing that many costs
+/// more than reading them.
 const MATCH_BUDGET_SHARE: u64 = 16;
 
-/// Matches always worth listing, whatever the share: about 30 µs of listing,
-/// below what reading a memtable costs.
+/// Matches always worth listing, whatever the share.
 const MIN_MATCH_BUDGET: u64 = 4096;
 
-/// The share for a read that returns only each key's newest version. Each
-/// match then costs a seek in the primary-key index, and the read it replaces
-/// hashes every visible key: on 125,000 in-memory rows the two cross between
-/// 1/8 and 1/4 of the rows matching, alike for every index kind measured.
+/// The share for a read that keeps only each key's newest version, where each
+/// match also costs a seek in the primary-key index.
 const NEWEST_ONLY_MATCH_BUDGET_SHARE: u64 = 8;
 
 /// Metric counting the matches checked for being their key's newest version.
@@ -67,16 +58,10 @@ pub struct ScalarIndexExec {
     /// The index searches the filter was split into: a tree of `AND`/`OR` over
     /// per-index queries, built by the same pass the base table's scan uses.
     index_expr: ScalarIndexExpr,
-    /// The whole filter, compiled.
-    ///
-    /// Applied to the rows the indexes narrowed to. It is the filter itself
-    /// rather than a re-reading of the queries, because the two are not always
-    /// the same question — an R-tree narrows a spatial relation down to a
-    /// bounding box, and only the filter knows the relation that box stands in
-    /// for. `None` when the indexes answered exactly and nothing is left.
+    /// The whole filter, compiled, applied to the rows the indexes narrowed to;
+    /// `None` when they answered exactly.
     recheck: Option<PhysicalExprRef>,
-    /// Whether the index tree is the whole filter. When some condition had no
-    /// index to answer it, an exact index answer is still only a superset.
+    /// Whether the index tree is the whole filter.
     is_filter_covered: bool,
     readable_count: usize,
     projection: Option<Vec<usize>>,
@@ -92,8 +77,7 @@ pub struct ScalarIndexExec {
     /// filter its key's newest version fails, and must not be returned.
     newest_of: Option<Vec<usize>>,
     /// Run instead when the indexes match too many rows to be worth listing.
-    /// Required with `newest_of`: checking every visible row's key costs more
-    /// than the scan this stands in for.
+    /// Required with `newest_of`.
     broad_fallback: Option<Arc<dyn ExecutionPlan>>,
 }
 
@@ -206,48 +190,34 @@ impl ScalarIndexExec {
 
     /// Evaluate the index searches: the candidate positions, or `None` when
     /// every visible row is one, and whether the answer still needs the filter.
-    fn query_index(&self) -> (Option<Vec<u64>>, bool) {
+    fn query_index(&self) -> Result<(Option<Vec<u64>>, bool)> {
         let Some(max_readable_row) = self.compute_max_readable_row() else {
-            return (Some(Vec::new()), true);
+            return Ok((Some(Vec::new()), true));
         };
         let visible_rows = max_readable_row + 1;
         let budget = self.match_budget(visible_rows);
         let mut ctx = SearchContext::new(max_readable_row);
-        // A declined search leaves the rows to the filter or to the fallback,
-        // so only offer an index the choice when there is one to apply.
+        // Offer an index the choice to decline only when a filter or fallback
+        // can take its rows.
         if self.recheck.is_some() || self.broad_fallback.is_some() {
             ctx = ctx.with_match_budget(budget);
         }
-        match evaluate_index_filter(&self.index_expr, &self.indexes, &ctx) {
-            Ok(result) if result.at_most.len() == visible_rows => (None, result.is_exact()),
-            // A budget is a request, so an index may list past it. The fallback
-            // is cheaper than checking that many rows' keys.
-            Ok(result) if self.broad_fallback.is_some() && result.at_most.len() > budget => {
-                (None, result.is_exact())
-            }
-            Ok(result) => {
-                let exact = result.is_exact();
-                (Some(result.at_most.into()), exact)
-            }
-            // A failing index must not answer "no rows". Every visible row is a
-            // candidate and the filter decides, which is a scan.
-            Err(error) => {
-                log::warn!(
-                    "a memtable index failed to search {}; reading every row instead: {error}",
-                    self.index_expr
-                );
-                (None, false)
-            }
-        }
+        let result = evaluate_index_filter(&self.index_expr, &self.indexes, &ctx)?;
+        let exact = result.is_exact();
+        // An index may list past its budget; the fallback is then cheaper.
+        let past_budget = self.broad_fallback.is_some() && result.at_most.len() > budget;
+        Ok(if past_budget || result.at_most.len() == visible_rows {
+            (None, exact)
+        } else {
+            (Some(result.at_most.into()), exact)
+        })
     }
 
     /// Read the candidate rows, one stored batch at a time: those at
     /// `candidates` (ascending), or every visible row when it is `None`.
     ///
-    /// A touched batch is filtered with a mask, as a full read filters it,
-    /// rather than gathered row by row, and a batch without a candidate is
-    /// never read. `recheck` is the whole filter, applied when the indexes did
-    /// not settle it; it runs once per touched batch.
+    /// Each touched batch is filtered with one mask, and a batch without a
+    /// candidate is not read.
     fn read_rows(
         &self,
         candidates: Option<&[u64]>,
@@ -461,16 +431,14 @@ impl ExecutionPlan for ScalarIndexExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let newest_checks =
             MetricBuilder::new(&self.metrics).counter(NEWEST_CHECKS_METRIC, partition);
-        let (positions, exact) = self.query_index();
+        let (positions, exact) = self.query_index()?;
         if positions.is_none()
             && let Some(fallback) = &self.broad_fallback
         {
             return fallback.execute(partition, context);
         }
 
-        // An index that only narrows hands back candidates, and so does an
-        // exact index answer to part of the filter, so the filter decides here.
-        // Dropping this would surface rows that do not match.
+        // Candidates from a narrowing or partial answer still need the filter.
         let recheck = if !exact || !self.is_filter_covered {
             let Some(recheck) = &self.recheck else {
                 return Err(datafusion::error::DataFusionError::Internal(
@@ -550,8 +518,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Past the match budget the index declines and every visible row is read
-    /// with the filter: exactly the filter's rows and row ids come back, and a
+    /// Past the match budget every visible row is read with the filter, and a
     /// batch past the readable count stays unread.
     #[tokio::test]
     async fn a_broad_answer_reads_every_visible_row_with_the_filter() {

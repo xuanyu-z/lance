@@ -4,8 +4,6 @@
 //! FtsIndexExec - Full-text search with MVCC visibility.
 
 use std::collections::{HashMap, hash_map::Entry};
-
-use crate::dataset::mem_wal::index::{FtsEntry, FtsMemQuery, MemMatches, SearchContext};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -30,7 +28,9 @@ use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
 use super::super::builder::FtsQuery;
 use super::{newest_pk_positions, scan_record_batch};
-use crate::dataset::mem_wal::index::{SearchOptions, search_cross_column};
+use crate::dataset::mem_wal::index::{
+    FtsEntry, FtsMemQuery, MemMatches, SearchContext, SearchOptions, search_cross_column,
+};
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -116,9 +116,6 @@ impl FtsIndexExec {
         base_schema: SchemaRef,
         with_row_id: bool,
     ) -> Result<Self> {
-        // Every part of the search needs an index that answers it. A
-        // cross-column predicate is one predicate: a column with no arm is a
-        // missing answer rather than a narrower one.
         if !query.is_answered_by(&indexes) {
             return Err(Error::invalid_input(format!(
                 "no full-text index answers this search over {:?}",
@@ -225,17 +222,10 @@ impl FtsIndexExec {
     fn query_index(&self) -> Result<Vec<FtsHit>> {
         let columns = self.query.columns();
         if columns.len() > 1 {
-            return self.query_across_columns(&columns);
+            return self.query_across_columns();
         }
-        let Some(&column) = columns.first() else {
+        let Some((column, question)) = self.query.index_questions().into_iter().next() else {
             return Err(Error::invalid_input(
-                "full-text search names no column to search".to_string(),
-            ));
-        };
-        // Planning chose this arm because an index answered this question;
-        // finding none now means an index broke that contract.
-        let Some((_, question)) = self.query.index_questions().into_iter().next() else {
-            return Err(Error::internal(
                 "full-text search names no column to search".to_string(),
             ));
         };
@@ -271,23 +261,17 @@ impl FtsIndexExec {
             options,
             granularity: self.query.document_granularity,
         };
-        let ctx = SearchContext::new(self.max_readable_row.unwrap_or(u64::MAX));
-        let Some(MemMatches::Ranked(ranked)) = index.search(&query, &ctx)? else {
+        let Some(max_visible) = self.max_readable_row else {
+            return Ok(vec![]);
+        };
+        let Some(MemMatches::Ranked(ranked)) =
+            index.search(&query, &SearchContext::new(max_visible))?
+        else {
             return Err(declined(column));
         };
-        let entries: Vec<FtsEntry> = ranked
+        Ok(ranked
             .into_iter()
-            .map(|m| FtsEntry {
-                row_position: m.position,
-                doc_index: m.element,
-                score: m.score,
-            })
-            .collect();
-
-        // Convert to (row_position, element ordinal, score) tuples.
-        Ok(entries
-            .into_iter()
-            .map(|entry| (entry.row_position, entry.doc_index, entry.score))
+            .map(|hit| (hit.position, hit.element, hit.score))
             .collect())
     }
 
@@ -298,53 +282,32 @@ impl FtsIndexExec {
     /// visibility ceiling goes *in* rather than being applied after, so leaves
     /// read from indexes whose tails have advanced differently still meet over
     /// one cut.
-    fn query_across_columns(&self, columns: &[&str]) -> Result<Vec<FtsHit>> {
-        // Each leaf is answered by the one index on its column; the tree is
-        // combined without any index taking part. So the leaves resolve through
-        // the same interface a single-column search uses, and a plugin serves
-        // one here exactly as it would on its own.
-        let _ = columns;
+    fn query_across_columns(&self) -> Result<Vec<FtsHit>> {
+        let Some(max_visible) = self.max_readable_row else {
+            return Ok(vec![]);
+        };
         let options = SearchOptions::new().with_include_tail(self.query.include_tail);
-        let max_visible = self.max_readable_row.unwrap_or(u64::MAX);
-
         let ctx = SearchContext::new(max_visible);
-        // The first index to fail, or to decline a leaf it accepted while
-        // planning; the combination below cannot carry an error itself.
-        let failure: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
-        let combined = search_cross_column(&self.query.expr, |column, leaf| {
+        Ok(search_cross_column(&self.query.expr, |column, leaf| {
             let query = FtsMemQuery {
                 expr: leaf.clone(),
                 options: options.clone(),
                 granularity: self.query.document_granularity,
             };
-            let index = self.indexes.index_answering(column, &query)?;
-            match index.search(&query, &ctx) {
-                Ok(Some(MemMatches::Ranked(ranked))) => Some(
-                    ranked
-                        .into_iter()
-                        .map(|m| FtsEntry {
-                            row_position: m.position,
-                            doc_index: m.element,
-                            score: m.score,
-                        })
-                        .collect(),
-                ),
-                outcome => {
-                    failure.borrow_mut().get_or_insert(match outcome {
-                        Err(error) => error,
-                        Ok(_) => declined(column),
-                    });
-                    Some(Vec::new())
+            let index = self
+                .indexes
+                .index_answering(column, &query)
+                .ok_or_else(|| declined(column))?;
+            match index.search(&query, &ctx)? {
+                Some(MemMatches::Ranked(ranked)) => {
+                    Ok(ranked.into_iter().map(FtsEntry::from).collect())
                 }
+                _ => Err(declined(column)),
             }
-        })?;
-        if let Some(error) = failure.into_inner() {
-            return Err(error);
-        }
-        Ok(combined
-            .into_iter()
-            .map(|entry| (entry.row_position, entry.doc_index, entry.score))
-            .collect())
+        })?
+        .into_iter()
+        .map(|entry| (entry.row_position, entry.doc_index, entry.score))
+        .collect())
     }
 
     /// Filter results by MVCC visibility using max_row_position. O(n).
@@ -780,7 +743,8 @@ impl ExecutionPlan for FtsIndexExec {
     }
 }
 
-/// An index planning routed a full-text search to declined it at execution.
+/// The error for a full-text index that declined, while searching, a query it
+/// accepted while planning.
 fn declined(column: &str) -> Error {
     Error::internal(format!(
         "the full-text index on '{column}' declined a search it accepted while planning"

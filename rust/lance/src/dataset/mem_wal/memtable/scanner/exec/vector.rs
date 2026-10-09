@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! VectorIndexExec - vector search answered by a memtable index, with MVCC
+//! VectorIndexExec - a vector search answered by a memtable index, with MVCC
 //! visibility.
 
 use std::fmt::{Debug, Formatter};
@@ -152,39 +152,31 @@ impl VectorIndexExec {
     }
 
     /// Search the index planning chose and return `(distance, position)` pairs.
+    /// Planning chose an index that accepted this query, so none now, or a
+    /// decline, is an error.
     fn query_index(&self) -> Result<Vec<(f32, u64)>> {
-        let query = self.query.mem_query()?;
         let Some(max_readable_row) = self.compute_max_readable_row() else {
             return Ok(vec![]);
         };
-        // Planning chose this arm because an index answered this exact query;
-        // finding none now, or a decline, means an index broke that contract.
+        let query = self.query.mem_query()?;
+        let column = &self.query.column;
         let index = self
             .indexes
-            .index_answering(&self.query.column, &query)
+            .index_answering(column, &query)
             .ok_or_else(|| {
                 Error::internal(format!(
-                    "no index on '{}' answers the vector search planning routed to it",
-                    self.query.column
+                    "no index on '{column}' answers the vector search planning routed to it"
                 ))
             })?;
-        let ctx = SearchContext::new(max_readable_row);
-        let mut results: Vec<(f32, u64)> = match index.search(&query, &ctx)? {
-            Some(MemMatches::Ranked(matches)) => {
-                matches.into_iter().map(|m| (m.score, m.position)).collect()
-            }
-            other => {
-                return Err(Error::internal(format!(
-                    "the index on '{}' accepted a vector search, then answered {}",
-                    self.query.column,
-                    if other.is_none() {
-                        "nothing"
-                    } else {
-                        "a filter"
-                    }
-                )));
-            }
+        let Some(MemMatches::Ranked(matches)) =
+            index.search(&query, &SearchContext::new(max_readable_row))?
+        else {
+            return Err(Error::internal(format!(
+                "the index on '{column}' accepted a vector search, then did not answer it"
+            )));
         };
+        let mut results: Vec<(f32, u64)> =
+            matches.into_iter().map(|m| (m.score, m.position)).collect();
 
         if self.query.distance_lower_bound.is_some() || self.query.distance_upper_bound.is_some() {
             results.retain(|&(dist, _)| {

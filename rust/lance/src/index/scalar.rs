@@ -405,26 +405,12 @@ pub(super) async fn build_scalar_index(
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match (preprocessed_data, resolved_fts_field.as_ref()) {
         (Some((preprocessed_data, declared)), _) => {
-            // The rows reach the trainer untouched, so a caller that prepared
-            // them in a different shape than this index trains from would
-            // produce an index that disagrees with its own data. Refuse rather
-            // than train, and name both sides.
             let required = training_request.criteria();
-            if declared.ordering != required.ordering
-                || declared.needs_row_ids != required.needs_row_ids
-                || declared.needs_row_addrs != required.needs_row_addrs
-            {
+            if declared != *required {
                 return Err(Error::invalid_input(format!(
-                    "preprocessed data for index type '{}' is declared as (ordering {:?}, \
-                     row ids {}, row addrs {}) but that index trains from (ordering {:?}, \
-                     row ids {}, row addrs {})",
-                    params.index_type,
-                    declared.ordering,
-                    declared.needs_row_ids,
-                    declared.needs_row_addrs,
-                    required.ordering,
-                    required.needs_row_ids,
-                    required.needs_row_addrs,
+                    "preprocessed data for index type '{}' is {declared:?}, but it trains from \
+                     {required:?}",
+                    params.index_type
                 )));
             }
             preprocessed_data

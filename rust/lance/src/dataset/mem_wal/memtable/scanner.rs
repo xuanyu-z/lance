@@ -30,12 +30,11 @@
 //! ## Key Features
 //!
 //! - **MVCC Visibility**: All scans respect visibility sequence numbers
-//! - **Index Support**: whichever indexes the memtable maintains, asked by
+//! - **Index Support**: whichever indexes the memtable maintains, chosen by
 //!   what they can answer
 //! - **DataFusion Integration**: Full ExecutionPlan compatibility
 
 mod builder;
-
 mod exec;
 
 pub use builder::MemTableScanner;

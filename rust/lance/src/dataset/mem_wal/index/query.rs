@@ -3,28 +3,14 @@
 
 //! What a memtable index can be asked, and what it answers.
 //!
-//! One vocabulary covers every family. A scalar index, a vector index and a
-//! full-text index differ in the question they take and the shape of the answer
-//! they give, not in how they are reached, so there is one query type and one
-//! result type rather than a method per family.
-//!
-//! The query type is open: [`MemQuery`] is implemented for anything, and
-//! blanket-implemented for every [`AnyQuery`] Lance already defines. A plugin
-//! that invents a question needs no change here, and a scalar plugin reuses the
-//! query types its on-disk index already answers.
-//!
-//! The answer comes in two shapes because there really are two. A filter names
-//! a set of rows and the set can be bracketed — some rows certainly match, some
-//! might. A ranked search names an ordered list with scores, where bracketing
-//! means nothing. [`MemMatches`] is that distinction and nothing more.
+//! [`MemQuery`] is open to any query type, Lance's scalar index queries
+//! included. [`MemMatches`] is either a filter's set of rows or a search's
+//! ranked list.
 
 use std::any::Any;
 use std::fmt::Debug;
 
-use std::sync::Arc;
-
 use arrow_array::FixedSizeListArray;
-use arrow_schema::{DataType, Field};
 use lance_index::scalar::AnyQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_linalg::distance::DistanceType;
@@ -33,15 +19,8 @@ use roaring::RoaringTreemap;
 use super::RowPosition;
 
 /// A question put to a memtable index.
-///
-/// Implemented for free by every [`AnyQuery`], so a scalar plugin asks its
-/// memtable index exactly what it asks its on-disk index. A family with no
-/// on-disk query type — vector search and full-text search, which arrive from
-/// the scan API rather than from a filter expression — implements this
-/// directly.
 pub trait MemQuery: Debug + Send + Sync {
-    /// Downcast hook. An index knows the concrete queries it answers and
-    /// recognises them here; one it does not recognise it declines.
+    /// The concrete query, for an index to recognise the ones it answers.
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -51,13 +30,8 @@ impl<T: AnyQuery> MemQuery for T {
     }
 }
 
-/// A Lance scalar query that is already behind a trait object.
-///
-/// The blanket implementation above covers a concrete query type, but Rust
-/// cannot re-point a `&dyn AnyQuery` at another trait, and the expression pass
-/// hands out exactly that. Wrapping is the whole difference: an index sees the
-/// same query through [`MemQuery::as_any`] either way, so nothing downstream
-/// distinguishes them.
+/// A Lance scalar query behind a trait object, as the expression pass hands it
+/// out.
 #[derive(Debug)]
 pub struct ScalarQuery<'a>(pub &'a dyn AnyQuery);
 
@@ -68,10 +42,6 @@ impl MemQuery for ScalarQuery<'_> {
 }
 
 /// A set of positions in one memtable.
-///
-/// Roaring rather than a `Vec` because posting lists intersect and union on
-/// every compound filter, and because a set covering most of a large memtable
-/// is a run rather than millions of entries.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PositionSet(RoaringTreemap);
 
@@ -81,11 +51,8 @@ impl PositionSet {
         Self(RoaringTreemap::new())
     }
 
-    /// Every position a reader may see, which is every position up to and
-    /// including `max_visible`.
+    /// Every position up to and including `max_visible`.
     pub fn all_visible(max_visible: RowPosition) -> Self {
-        // A range insert fills whole containers rather than adding positions one
-        // by one, which a broad filter would otherwise pay on every query.
         let mut positions = RoaringTreemap::new();
         positions.insert_range(0..=max_visible);
         Self(positions)
@@ -117,11 +84,10 @@ impl PositionSet {
     }
 
     /// Drop everything above `max_visible`.
-    ///
-    /// An index may hold rows a reader must not see yet, because a writer runs
-    /// ahead of the watermark that publishes its rows.
     pub fn truncate_to(mut self, max_visible: RowPosition) -> Self {
-        self.0.remove_range(max_visible.saturating_add(1)..);
+        if let Some(first_hidden) = max_visible.checked_add(1) {
+            self.0.remove_range(first_hidden..);
+        }
         self
     }
 }
@@ -158,24 +124,14 @@ impl std::ops::BitOr for PositionSet {
     }
 }
 
-/// Which rows a filter matched, bracketed, in the terms of Lance's scalar
-/// `SearchResult`.
-///
-/// An index that locates rows knows the answer. One that only narrows knows a
-/// superset. The two are the endpoints of one interval, so a compound filter
-/// combines them elementwise and the caller asks one question of the result —
-/// is it settled — rather than tracking which index was which.
-///
-/// * `at_least` — rows that definitely match.
-/// * `at_most` — rows that might; a row outside it definitely does not.
-///
-/// A settled answer has the two equal. A narrowing index leaves `at_least`
-/// empty and the caller re-checks `at_most`.
+/// Which rows a filter matched, as two bounds like Lance's scalar
+/// `SearchResult`: exact when they are equal, otherwise the caller re-checks
+/// the rows in `at_most`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemSearchResult {
-    /// Rows guaranteed to match.
+    /// Rows that match.
     pub at_least: PositionSet,
-    /// Rows that may match. Nothing outside this set matches.
+    /// Rows that may match; nothing outside them does.
     pub at_most: PositionSet,
 }
 
@@ -219,8 +175,7 @@ impl MemSearchResult {
 impl std::ops::BitAnd for MemSearchResult {
     type Output = Self;
 
-    /// Rows matching both. Rows certain on both sides stay certain; either
-    /// side's upper bound bounds the result.
+    /// Rows matching both.
     fn bitand(self, rhs: Self) -> Self {
         Self {
             at_least: self.at_least & rhs.at_least,
@@ -246,11 +201,11 @@ impl std::ops::BitOr for MemSearchResult {
 pub struct RankedMatch {
     /// Where the row sits in the memtable.
     pub position: RowPosition,
-    /// How well it scored. Lower is nearer for a vector distance; higher is
-    /// better for a relevance score. Which way round is the query's business.
+    /// Its score: a distance, lower is better, or a full-text relevance,
+    /// higher is better.
     pub score: f32,
-    /// For a document nested inside a list, which element matched. `None` when
-    /// the whole row is the document.
+    /// The indices of the list element that matched, outermost first, for a
+    /// document nested in lists.
     pub element: Option<Vec<u32>>,
 }
 
@@ -277,10 +232,9 @@ impl RankedMatch {
 /// What a search answered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemMatches {
-    /// A set of rows, bracketed. What a filter asks for.
+    /// The rows a filter matched.
     Filter(MemSearchResult),
-    /// Rows in rank order, best first. What a vector or full-text search asks
-    /// for, where a set with no order would lose the answer.
+    /// The rows a vector or full-text search found, best first.
     Ranked(Vec<RankedMatch>),
 }
 
@@ -290,7 +244,7 @@ impl MemMatches {
         Self::Filter(MemSearchResult::exact(positions.into_iter().collect()))
     }
 
-    /// A narrowed set the caller re-checks.
+    /// Candidate rows the caller re-checks.
     pub fn at_most(positions: impl IntoIterator<Item = RowPosition>) -> Self {
         Self::Filter(MemSearchResult::at_most(positions.into_iter().collect()))
     }
@@ -320,14 +274,11 @@ impl MemMatches {
 /// What a search needs to know besides the query itself.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchContext {
-    /// The highest position a reader may see. An index holds rows past it —
-    /// a writer runs ahead of the watermark that publishes them — and must not
-    /// return one.
+    /// The highest position a reader may see. An index may hold rows past it
+    /// and must not return them.
     pub max_visible: RowPosition,
-    /// How many matching rows are worth listing, when there is a limit. An
-    /// index that would list more may return `Ok(None)`, and the caller reads
-    /// every row instead: past some share of the memtable that costs less than
-    /// listing matches one by one. Honouring it is optional.
+    /// How many matching rows are worth listing. An index that would list more
+    /// may decline with `Ok(None)`, and the caller reads every row.
     pub match_budget: Option<u64>,
 }
 
@@ -348,9 +299,6 @@ impl SearchContext {
 }
 
 /// Nearest-neighbour search over one vector column.
-///
-/// A query the scan API raises rather than a filter expression, so it has no
-/// on-disk counterpart to borrow and is defined here.
 #[derive(Debug)]
 pub struct VectorMemQuery {
     /// Exactly one query vector.
@@ -360,31 +308,7 @@ pub struct VectorMemQuery {
     /// Search breadth, or `None` for the index's own default.
     pub ef: Option<usize>,
     /// The metric the caller asked for, or `None` to accept the index's own.
-    ///
-    /// A graph's metric is baked into its structure, so an index built for a
-    /// different one declines rather than answering in the wrong space.
     pub distance_type: Option<DistanceType>,
-}
-
-impl VectorMemQuery {
-    /// A query carrying only what index routing turns on.
-    ///
-    /// Planning asks an index whether it can answer before there is a query to
-    /// hand it, and for nearest-neighbour search the answer turns on the metric
-    /// alone. Passing a real query shape rather than a capability flag is what
-    /// keeps routing open: a plugin decides for itself what it can serve.
-    pub fn probe(distance_type: Option<DistanceType>) -> Self {
-        Self {
-            vector: FixedSizeListArray::new_null(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                1,
-                0,
-            ),
-            k: 0,
-            ef: None,
-            distance_type,
-        }
-    }
 }
 
 impl MemQuery for VectorMemQuery {
@@ -393,26 +317,20 @@ impl MemQuery for VectorMemQuery {
     }
 }
 
-/// A full-text query tree, with the recall and limit knobs a text search needs
-/// and a filter predicate has no equivalent of.
+/// A full-text query tree with its search options.
 #[derive(Debug)]
 pub struct FtsMemQuery {
     /// The query.
     pub expr: super::fts::FtsQueryExpr,
     /// Recall, pruning and limit.
     pub options: super::fts::SearchOptions,
-    /// Whether the caller is searching whole rows or the elements of a list.
-    ///
-    /// Two full-text indexes may cover one column at different granularities,
-    /// and only the one that was built the way the query asks can answer it.
+    /// Whether the search covers whole rows or the elements of a list.
     pub granularity: DocumentGranularity,
 }
 
 impl FtsMemQuery {
-    /// A query carrying only what index routing turns on.
-    ///
-    /// As [`VectorMemQuery::probe`]; for full-text search the answer turns on
-    /// document granularity alone.
+    /// A query carrying only the granularity, for asking an index whether it
+    /// serves one.
     pub fn probe(granularity: DocumentGranularity) -> Self {
         Self {
             expr: super::fts::FtsQueryExpr::Match {

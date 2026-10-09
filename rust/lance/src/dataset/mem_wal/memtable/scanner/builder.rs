@@ -64,19 +64,19 @@ impl VectorQuery {
     /// The question a vector index is asked, exactly as it will be searched.
     pub(crate) fn mem_query(&self) -> Result<VectorMemQuery> {
         use arrow_array::cast::AsArray;
-        let query_array = self.query_vector.as_ref();
-        let vector = if let Some(fsl) = query_array.as_fixed_size_list_opt() {
-            fsl.clone()
-        } else {
-            let values = self.query_vector.clone();
-            let dim = values.len() as i32;
-            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
-            arrow_array::FixedSizeListArray::try_new(field, dim, values, None).map_err(|e| {
-                Error::invalid_input(format!(
-                    "Failed to wrap vector query into FixedSizeListArray (dim={}): {}",
-                    dim, e
-                ))
-            })?
+
+        let vector = match self.query_vector.as_fixed_size_list_opt() {
+            Some(vectors) => vectors.clone(),
+            None => {
+                let values = self.query_vector.clone();
+                let dim = values.len() as i32;
+                let item = Arc::new(Field::new("item", values.data_type().clone(), true));
+                arrow_array::FixedSizeListArray::try_new(item, dim, values, None).map_err(|e| {
+                    Error::invalid_input(format!(
+                        "the query vector does not form a vector of dimension {dim}: {e}"
+                    ))
+                })?
+            }
         };
         Ok(VectorMemQuery {
             vector,
@@ -121,10 +121,8 @@ pub const DEFAULT_WAND_FACTOR: f32 = 1.0;
 
 impl FtsQuery {
     /// What each index this search reaches is asked: the whole tree for a
-    /// search over one column, each leaf for a tree spanning several.
-    ///
-    /// Search options are left at their defaults: they are execution hints
-    /// the planner cannot know yet, so an index must not decline over them.
+    /// search over one column, each leaf for a tree spanning several. Search
+    /// options are left at their defaults; they must not decide the answer.
     pub(crate) fn index_questions(&self) -> Vec<(&str, FtsMemQuery)> {
         let ask = |expr: &FtsQueryExpr| FtsMemQuery {
             expr: expr.clone(),
@@ -613,9 +611,8 @@ impl MemTableScanner {
     }
 
     /// Let [`Self::create_dedup_plan`] answer a filter from the filter indexes,
-    /// keeping a match only when it is its key's newest visible version. When
-    /// the indexes match too many rows to be worth checking one by one, every
-    /// visible row is read instead, as without this. Needs a primary-key index.
+    /// keeping a match only when it is its key's newest visible version. Past
+    /// the match budget every visible row is read. Needs a primary-key index.
     pub fn with_memtable_filter_indexes(&mut self, enabled: bool) -> &mut Self {
         self.memtable_filter_indexes = enabled;
         self
@@ -1101,17 +1098,12 @@ impl MemTableScanner {
             return self.plan_fts_search(fts_query).await;
         }
 
-        // Split the filter into index searches and whatever is left. The same
-        // pass the base table's scan uses, so what an index claims here is what
-        // it claims there.
+        // Split the filter into index searches and whatever is left.
         if self.use_index
             && let Some(filter) = &self.filter
         {
-            // `filter()` stores the parsed expression without running
-            // `optimize_expr`, so run it here to plan from the same expression
-            // the full scan would evaluate. An expression `optimize_expr`
-            // rejects is reported by `plan_full_scan`, which runs the same
-            // pass, so there is nothing to report here.
+            // Plan from the optimized expression the full scan evaluates; one
+            // the optimizer rejects is reported by `plan_full_scan`.
             let planner = Planner::new(self.schema.clone());
             if let Ok(optimized) = planner.optimize_expr(filter.clone())
                 && let Some(split) = plan_filter(&optimized, self.indexes.filter_catalog())?
@@ -1215,8 +1207,7 @@ impl MemTableScanner {
             filter_expr.clone(),
         ));
 
-        // The newest-version check seeks the primary-key index, so without one
-        // there is nothing to check against.
+        // The newest-version check needs the primary-key index.
         let (true, Some(filter), true) = (
             self.memtable_filter_indexes,
             filter_expr.as_ref(),
@@ -1248,11 +1239,8 @@ impl MemTableScanner {
 
     /// Plan a filter answered from the memtable's indexes.
     ///
-    /// `split` is what the expression pass made of the filter: a tree of index
-    /// searches, and whatever is left over. The leftover is compiled and
-    /// applied to the rows the indexes narrowed to — as is the whole filter
-    /// when an index answered inexactly, because only the filter knows what a
-    /// narrowing index was standing in for.
+    /// The leftover expression, or the whole filter when an index answered
+    /// inexactly, is applied to the rows the indexes narrowed to.
     async fn plan_index_query(&self, split: IndexedExpression) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(index_expr) = split.scalar_query else {
             return self.plan_full_scan().await;
@@ -1324,7 +1312,8 @@ impl MemTableScanner {
         // is the only correct arm here. An upper bound is safe on HNSW: it
         // trims the far tail, which the top-k would have dropped anyway.
         let hnsw_safe_with_bounds = query.distance_lower_bound.is_none();
-        let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
+        let exec: Arc<dyn ExecutionPlan> = if self.use_index
+            && filter_predicate.is_none()
             && hnsw_safe_with_pk
             && hnsw_safe_with_bounds
             && self.has_index_for(&query.column, &query.mem_query()?)
@@ -1360,9 +1349,7 @@ impl MemTableScanner {
     /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        // Every queried column needs an index that answers its part: a
-        // cross-column predicate is one predicate, so a missing arm is a
-        // missing answer, not a smaller one.
+        // A column without an answering index leaves the search unanswered.
         if !query.is_answered_by(&self.indexes) {
             return self.empty_fts_plan(query.document_granularity);
         }
@@ -1457,9 +1444,6 @@ impl MemTableScanner {
     }
 
     /// Whether some index on `column` can answer `query`.
-    ///
-    /// One check for every family: planning hands an index the shape of the
-    /// question and takes its answer, rather than asking what type it is.
     fn has_index_for(&self, column: &str, query: &dyn MemQuery) -> bool {
         self.indexes.index_answering(column, query).is_some()
     }
@@ -1483,11 +1467,9 @@ mod tests {
             .sum::<usize>()
     }
 
-    /// A deduplicated filtered read answered from the filter indexes returns
-    /// exactly what reading every row returns: across updates that move a key
-    /// in and out of the filter, deletes, rows indexed but not yet visible, and
-    /// integer, string and composite keys — whether the matches are checked one
-    /// by one or are too many and every row is read.
+    /// A deduplicated filtered read from the filter indexes returns what
+    /// reading every row returns, across overwrites, deletes, rows not yet
+    /// visible, and integer, string and composite keys.
     #[tokio::test]
     async fn memtable_filter_indexes_answer_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -1638,8 +1620,8 @@ mod tests {
         );
     }
 
-    /// The match budget is a request an index may ignore. One that lists every
-    /// match anyway must still not have each of them checked.
+    /// An index that lists matches past the budget still gets every row read
+    /// rather than each match checked.
     #[tokio::test]
     async fn memtable_filter_indexes_read_every_row_past_the_budget_whatever_the_index() {
         use crate::dataset::mem_wal::index::{
@@ -1754,6 +1736,7 @@ mod tests {
     }
 
     use crate::dataset::mem_wal::index::MemIndexSpec;
+    use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
     use arrow_array::{
         BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
     };
@@ -3216,6 +3199,184 @@ mod tests {
         );
     }
 
+    fn ids(batch: &RecordBatch) -> Vec<i32> {
+        let mut ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A memtable holding `batch`, maintaining `specs`.
+    fn memtable_over(specs: &[MemIndexSpec], batch: RecordBatch) -> MemTableScanner {
+        let schema = batch.schema();
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let indexes = IndexStore::from_specs(specs, &lance_schema, 100, 4).unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, offset, Some(position))
+            .unwrap();
+        MemTableScanner::new(batch_store, Arc::new(indexes), schema)
+    }
+
+    fn id_btree(deviation: Deviation) -> MemIndexSpec {
+        wrapped(MemIndexSpec::btree("id_idx", 0, "id"), deviation)
+    }
+
+    /// A comparison with null is never true, so null rows match no `IN` list.
+    #[tokio::test]
+    async fn a_null_in_an_in_list_matches_no_row() {
+        let schema = create_test_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("b"), None])),
+            ],
+        )
+        .unwrap();
+        let mut scanner = memtable_over(&[MemIndexSpec::btree("name_idx", 1, "name")], batch);
+        scanner.filter("name IN ('a', NULL)").unwrap();
+        assert_eq!(ids(&scanner.try_into_batch().await.unwrap()), vec![0]);
+    }
+
+    /// Rows an index offers only as candidates are checked against the filter
+    /// before they are returned.
+    #[tokio::test]
+    async fn candidate_rows_are_rechecked_against_the_filter() {
+        let schema = create_test_schema();
+        let mut scanner = memtable_over(
+            &[id_btree(Deviation::AnswersCandidates)],
+            create_test_batch(&schema, 0, 10),
+        );
+        scanner.filter("id = 1").unwrap();
+        assert_eq!(ids(&scanner.try_into_batch().await.unwrap()), vec![1]);
+    }
+
+    /// A filter index may decline, and every row is then read; a failed search
+    /// is an error, never an empty answer.
+    #[tokio::test]
+    async fn a_filter_index_that_declines_is_read_past_and_one_that_fails_errors() {
+        let schema = create_test_schema();
+        let filtered = |deviation| {
+            let mut scanner =
+                memtable_over(&[id_btree(deviation)], create_test_batch(&schema, 0, 10));
+            scanner.filter("id = 1").unwrap();
+            scanner
+        };
+        let declined = filtered(Deviation::AcceptsThenDeclines);
+        assert_eq!(ids(&declined.try_into_batch().await.unwrap()), vec![1]);
+        assert!(
+            filtered(Deviation::AcceptsThenFails)
+                .try_into_batch()
+                .await
+                .is_err()
+        );
+    }
+
+    fn vector_batch() -> RecordBatch {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        for id in 0..20 {
+            vectors.values().append_value(id as f32);
+            vectors.values().append_value(id as f32 * 0.5);
+            vectors.append(true);
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from((0..20).collect::<Vec<_>>())),
+                Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The three nearest ids, and the plan that found them.
+    async fn nearest_ids(specs: &[MemIndexSpec]) -> Result<(Vec<i32>, String)> {
+        let mut scanner = memtable_over(specs, vector_batch());
+        let query: Arc<dyn Array> = Arc::new(arrow_array::Float32Array::from(vec![3.0_f32, 1.5]));
+        scanner.nearest("vector", query.as_ref(), 3).unwrap();
+        let plan = scanner.create_plan().await?;
+        let plan = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
+        );
+        Ok((ids(&scanner.try_into_batch().await?), plan))
+    }
+
+    fn vector_index(deviation: Deviation) -> MemIndexSpec {
+        wrapped(
+            MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2),
+            deviation,
+        )
+    }
+
+    /// A vector index is chosen by the search it will run: one that declines it
+    /// leaves every vector to be read, one that only declines probes answers.
+    #[rstest::rstest]
+    #[case::declines_the_search(Deviation::DeclinesRealSearches, "MemTableBruteForceVector")]
+    #[case::declines_only_probes(Deviation::DeclinesProbes, "VectorIndex")]
+    #[tokio::test]
+    async fn a_vector_index_is_chosen_by_the_real_search(
+        #[case] deviation: Deviation,
+        #[case] route: &str,
+    ) {
+        let (ids, plan) = nearest_ids(&[vector_index(deviation)]).await.unwrap();
+        assert_eq!(ids, vec![2, 3, 4]);
+        assert!(plan.contains(route), "{plan}");
+    }
+
+    /// Declining at search time a search accepted while planning is an error.
+    #[tokio::test]
+    async fn a_vector_index_that_declines_after_accepting_is_an_error() {
+        let error = nearest_ids(&[vector_index(Deviation::AcceptsThenDeclines)])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error}");
+    }
+
+    async fn name_search(deviation: Deviation) -> Result<Vec<i32>> {
+        let schema = create_test_schema();
+        let mut scanner = memtable_over(
+            &[wrapped(MemIndexSpec::fts("name_fts", 1, "name"), deviation)],
+            create_test_batch(&schema, 0, 10),
+        );
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("5".to_string())
+                    .with_column("name".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+        Ok(ids(&scanner.try_into_batch().await?))
+    }
+
+    /// A full-text index is chosen by the search it will run, and declining it
+    /// after accepting is an error.
+    #[tokio::test]
+    async fn a_full_text_index_is_chosen_by_the_real_search() {
+        assert_eq!(
+            name_search(Deviation::DeclinesProbes).await.unwrap(),
+            vec![5]
+        );
+        assert!(name_search(Deviation::AcceptsThenDeclines).await.is_err());
+    }
+
     fn scan_ids(batch: &RecordBatch) -> Vec<i32> {
         batch["id"]
             .as_any()
@@ -3225,9 +3386,7 @@ mod tests {
             .to_vec()
     }
 
-    /// Only part of this filter has an index. The index answers `id >= 4`
-    /// exactly, but that is not the whole filter: `name = 'name_5'` still has
-    /// to be applied to what the index returns.
+    /// The unindexed part of a filter is applied to an exact index answer.
     #[tokio::test]
     async fn an_exact_index_answer_still_applies_the_unindexed_rest_of_the_filter() {
         let schema = create_test_schema();
@@ -3249,49 +3408,6 @@ mod tests {
         let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
         scanner.filter("id >= 4 AND name = 'name_5'").unwrap();
         assert_eq!(scan_ids(&scanner.try_into_batch().await.unwrap()), vec![5]);
-    }
-
-    /// Null is not below any number. The generic B-tree backend (the one
-    /// floats land in) sorts null keys first, so an open lower bound walks
-    /// straight into them unless it skips them.
-    #[rstest::rstest]
-    #[case::less_than("value < 2.0")]
-    #[case::at_most("value <= 2.0")]
-    #[tokio::test]
-    async fn an_open_lower_bound_on_a_float_index_excludes_nulls(#[case] filter: &str) {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Float64,
-            true,
-        )]));
-        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
-        let indexes = IndexStore::from_specs(
-            &[MemIndexSpec::btree("value_idx", 0, "value")],
-            &lance_schema,
-            100,
-            16,
-        )
-        .unwrap();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Float64Array::from(vec![
-                None,
-                Some(1.0),
-                Some(3.0),
-            ]))],
-        )
-        .unwrap();
-        let batch_store = Arc::new(BatchStore::with_capacity(16));
-        batch_store.append(batch.clone()).unwrap();
-        indexes
-            .insert_with_batch_position(&batch, 0, Some(0))
-            .unwrap();
-
-        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
-        scanner.filter(filter).unwrap();
-        let got = scanner.try_into_batch().await.unwrap();
-        assert_eq!(got.num_rows(), 1, "only 1.0 matches {filter}");
-        assert_eq!(got["value"].null_count(), 0);
     }
 
     /// Three batches holding the values a comparison is most likely to get
@@ -3431,9 +3547,8 @@ mod tests {
         rids
     }
 
-    /// Whatever an index answers must be what reading every row answers. Every
-    /// filter here goes both ways over the same memtable, with indexes on some
-    /// columns and not others so a filter mixes indexed and unindexed parts.
+    /// Every filter returns the same rows through the indexes as reading every
+    /// row, with indexes on some columns so filters mix both.
     #[tokio::test]
     async fn an_index_answers_every_filter_the_way_a_scan_does() {
         let filters = [
@@ -3519,252 +3634,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// How a test vector plugin treats the questions it is asked.
-    #[derive(Debug, Clone, Copy)]
-    enum Picky {
-        /// Answers routing probes, declines every real search.
-        DeclinesRealSearches,
-        /// Declines routing probes, answers every real search.
-        DeclinesProbes,
-        /// Says yes to everything, then declines at search time.
-        AcceptsThenDeclines,
-    }
-
-    /// A built-in, wrapped to be picky about what it answers.
-    #[derive(Debug)]
-    struct PickyPlugin {
-        rule: Picky,
-        inner: MemIndexSpec,
-    }
-
-    #[derive(Debug)]
-    struct PickyIndex(Picky, Arc<dyn crate::dataset::mem_wal::index::MemIndex>);
-
-    /// A routing probe: a vector search asking for nothing, or a full-text
-    /// match on no text.
-    fn is_probe(query: &dyn crate::dataset::mem_wal::index::MemQuery) -> bool {
-        let any = query.as_any();
-        any.downcast_ref::<VectorMemQuery>()
-            .is_some_and(|query| query.k == 0)
-            || any.downcast_ref::<FtsMemQuery>().is_some_and(|query| {
-                matches!(&query.expr, FtsQueryExpr::Match { query, .. } if query.is_empty())
-            })
-    }
-
-    #[async_trait::async_trait]
-    impl crate::dataset::mem_wal::index::MemIndexPlugin for PickyPlugin {
-        fn name(&self) -> &str {
-            "Picky"
-        }
-        fn details_message(&self) -> &str {
-            self.inner.plugin.details_message()
-        }
-        fn flush_index_type(&self) -> lance_index::IndexType {
-            self.inner.plugin.flush_index_type()
-        }
-        fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
-            self.inner.plugin.training_criteria()
-        }
-        fn validate(
-            &self,
-            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
-        ) -> Result<()> {
-            self.inner.plugin.validate(ctx)
-        }
-        fn create(
-            &self,
-            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
-        ) -> Result<Arc<dyn crate::dataset::mem_wal::index::MemIndex>> {
-            Ok(Arc::new(PickyIndex(
-                self.rule,
-                self.inner.plugin.create(ctx)?,
-            )))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::dataset::mem_wal::index::MemIndex for PickyIndex {
-        fn columns(&self) -> &[String] {
-            self.1.columns()
-        }
-        fn can_answer(&self, query: &dyn crate::dataset::mem_wal::index::MemQuery) -> bool {
-            self.1.can_answer(query)
-                && match self.0 {
-                    Picky::DeclinesRealSearches => is_probe(query),
-                    Picky::DeclinesProbes => !is_probe(query),
-                    Picky::AcceptsThenDeclines => true,
-                }
-        }
-        fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
-            self.1.insert(batch, row_offset)
-        }
-        fn resident_bytes(&self) -> usize {
-            self.1.resident_bytes()
-        }
-        fn search(
-            &self,
-            query: &dyn crate::dataset::mem_wal::index::MemQuery,
-            ctx: &crate::dataset::mem_wal::index::SearchContext,
-        ) -> Result<Option<crate::dataset::mem_wal::index::MemMatches>> {
-            match self.0 {
-                Picky::AcceptsThenDeclines => Ok(None),
-                _ if !self.can_answer(query) => Ok(None),
-                _ => self.1.search(query, ctx),
-            }
-        }
-        async fn flush(
-            &self,
-            ctx: &crate::dataset::mem_wal::index::FlushContext<'_>,
-        ) -> Result<crate::dataset::mem_wal::index::FlushOutcome> {
-            self.1.flush(ctx).await
-        }
-    }
-
-    fn vector_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
-                true,
-            ),
-        ]))
-    }
-
-    /// A 20-row memtable of points on a line, maintained by `spec` if given.
-    fn vector_memtable(spec: Option<MemIndexSpec>) -> MemTableScanner {
-        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-        let schema = vector_schema();
-        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
-        let specs: Vec<MemIndexSpec> = spec.into_iter().collect();
-        let indexes = IndexStore::from_specs(&specs, &lance_schema, 100, 4).unwrap();
-        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 2);
-        for id in 0..20 {
-            vectors.values().append_value(id as f32);
-            vectors.values().append_value(id as f32 * 0.5);
-            vectors.append(true);
-        }
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from((0..20).collect::<Vec<_>>())),
-                Arc::new(vectors.finish()),
-            ],
-        )
-        .unwrap();
-        let batch_store = Arc::new(BatchStore::with_capacity(4));
-        let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
-        indexes
-            .insert_with_batch_position(&batch, offset, Some(position))
-            .unwrap();
-        MemTableScanner::new(batch_store, Arc::new(indexes), schema)
-    }
-
-    /// `inner`, maintained by a plugin that follows `rule`.
-    fn picky(rule: Picky, inner: MemIndexSpec) -> MemIndexSpec {
-        MemIndexSpec {
-            plugin: Arc::new(PickyPlugin {
-                rule,
-                inner: inner.clone(),
-            }),
-            ..inner
-        }
-    }
-
-    fn vector_spec() -> MemIndexSpec {
-        MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2)
-    }
-
-    async fn nearest_ids(mut scanner: MemTableScanner) -> Result<(Vec<i32>, String)> {
-        let query: Arc<dyn arrow_array::Array> =
-            Arc::new(arrow_array::Float32Array::from(vec![3.0_f32, 1.5_f32]));
-        scanner.nearest("vector", query.as_ref(), 3).unwrap();
-        let plan = scanner.create_plan().await?;
-        let rendered = format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
-        );
-        let batch = scanner.try_into_batch().await?;
-        let mut ids = scan_ids(&batch);
-        ids.sort_unstable();
-        Ok((ids, rendered))
-    }
-
-    /// An index that declines the real search is not used, and the rows come
-    /// from reading every vector instead of coming back empty.
-    #[tokio::test]
-    async fn a_vector_index_that_declines_the_real_search_falls_back_to_a_full_read() {
-        let (expected, _) = nearest_ids(vector_memtable(None)).await.unwrap();
-        assert_eq!(expected, vec![2, 3, 4]);
-        let (ids, plan) = nearest_ids(vector_memtable(Some(picky(
-            Picky::DeclinesRealSearches,
-            vector_spec(),
-        ))))
-        .await
-        .unwrap();
-        assert_eq!(ids, expected, "{plan}");
-        assert!(plan.contains("MemTableBruteForceVector"), "{plan}");
-    }
-
-    /// An index is chosen by the search it will actually run, so one that has
-    /// no use for an empty probe is still used.
-    #[tokio::test]
-    async fn a_vector_index_is_chosen_by_the_real_search() {
-        let (ids, plan) = nearest_ids(vector_memtable(Some(picky(
-            Picky::DeclinesProbes,
-            vector_spec(),
-        ))))
-        .await
-        .unwrap();
-        assert_eq!(ids, vec![2, 3, 4]);
-        assert!(plan.contains("VectorIndex"), "{plan}");
-    }
-
-    /// An index that accepts a search while planning and declines it when run
-    /// breaks its contract; that is an error, not an empty answer.
-    #[tokio::test]
-    async fn a_vector_index_that_declines_after_accepting_is_an_error() {
-        let error = nearest_ids(vector_memtable(Some(picky(
-            Picky::AcceptsThenDeclines,
-            vector_spec(),
-        ))))
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("accepted a vector search"),
-            "{error}"
-        );
-    }
-
-    /// A full-text index is chosen by the search it will run: one that has no
-    /// use for an empty probe still answers, rather than the memtable
-    /// answering nothing.
-    #[tokio::test]
-    async fn a_full_text_index_is_chosen_by_the_real_search() {
-        let schema = create_test_schema();
-        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
-        let spec = picky(
-            Picky::DeclinesProbes,
-            MemIndexSpec::fts("name_fts", 1, "name"),
-        );
-        let indexes = IndexStore::from_specs(&[spec], &lance_schema, 100, 16).unwrap();
-        let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let batch = create_test_batch(&schema, 0, 10);
-        let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
-        indexes
-            .insert_with_batch_position(&batch, offset, Some(position))
-            .unwrap();
-
-        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
-        scanner
-            .full_text_search(
-                FullTextSearchQuery::new("5".to_string())
-                    .with_column("name".to_string())
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(scan_ids(&scanner.try_into_batch().await.unwrap()), vec![5]);
     }
 }

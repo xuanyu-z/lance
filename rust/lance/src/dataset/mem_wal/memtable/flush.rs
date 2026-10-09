@@ -8,22 +8,23 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use bytes::Bytes;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::cache::LanceCache;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
+use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::{ShardManifest, SsTable};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use log::{info, warn};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use tracing::instrument;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
-use super::super::index::{FlushContext, FlushOutcome, GenerationWrite, MemIndexSpec};
+use super::super::index::{FlushContext, FlushOutcome, GenerationWrite, IndexStore, MemIndexSpec};
 use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
@@ -32,6 +33,7 @@ use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
 use crate::dataset::write::InsertBuilder;
+use crate::index::CreateIndexBuilder;
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -262,7 +264,7 @@ impl MemTableFlusher {
     /// `base_uri` (e.g. flusher unit tests that run without a committed base).
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
-    async fn base_storage_version(&self) -> Result<lance_file::version::ConcreteFileVersion> {
+    async fn base_storage_version(&self) -> Result<ConcreteFileVersion> {
         match self.open_base().await {
             Ok(dataset) => Ok(dataset.manifest().data_storage_format.lance_file_format()),
             Err(Error::DatasetNotFound { .. }) => Ok(lance_file::version::stable_file_version()),
@@ -311,7 +313,12 @@ impl MemTableFlusher {
         );
 
         let (rows_flushed, deleted) = self
-            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .write_data_file(
+                &gen_path,
+                memtable,
+                preassigned_data_file_name.as_deref(),
+                self.base_storage_version().await?,
+            )
             .await?;
 
         // Persist the within-generation deletion vector so the
@@ -371,6 +378,7 @@ impl MemTableFlusher {
         path: &Path,
         memtable: &MemTable,
         preassigned_data_file_name: Option<&str>,
+        storage_version: ConcreteFileVersion,
     ) -> Result<(usize, RoaringBitmap)> {
         use arrow_array::RecordBatchIterator;
 
@@ -449,7 +457,7 @@ impl MemTableFlusher {
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
-            data_storage_version: Some(self.base_storage_version().await?.to_selector()),
+            data_storage_version: Some(storage_version.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -572,39 +580,35 @@ impl MemTableFlusher {
             memtable.batch_count()
         );
 
+        let storage_version = self.base_storage_version().await?;
         let (total_rows, deleted) = self
-            .write_data_file(&gen_path, memtable, preassigned_data_file_name.as_deref())
+            .write_data_file(
+                &gen_path,
+                memtable,
+                preassigned_data_file_name.as_deref(),
+                storage_version,
+            )
             .await?;
 
-        // Open the dataset once for all index building. Dataset::write already
-        // created a v1 manifest with the fragment data.
+        // Dataset::write already committed the data; the indexes join it in
+        // one manifest below.
         let uri = self.path_to_uri(&gen_path);
         let mut dataset = self.open_generation(&uri).await?;
-
-        // Collect all index metadata without committing individually.
-        // We write a single manifest containing both data and all indexes.
-        let mut all_indexes: Vec<IndexMetadata> = Vec::new();
-
-        let storage_version =
-            crate::dataset::versions::index_file_version(self.base_storage_version().await?);
-        let created = self
+        let all_indexes = self
             .create_indexes(
                 &mut dataset,
                 &gen_path,
                 index_specs,
                 memtable.indexes(),
                 total_rows,
-                storage_version,
+                crate::dataset::versions::index_file_version(storage_version),
             )
             .await?;
-        if !created.is_empty() {
-            info!(
-                "Created {} indexes on SSTable {}",
-                created.len(),
-                generation
-            );
-        }
-        all_indexes.extend(created);
+        info!(
+            generation,
+            index_count = all_indexes.len(),
+            "created indexes on SSTable"
+        );
 
         // Write the standalone primary-key dedup index (sidecar, not a manifest
         // index — the block-list opens it directly by path).
@@ -647,13 +651,9 @@ impl MemTableFlusher {
     }
 
     /// Build every index in `index_specs` into the flushed generation, one at a
-    /// time.
-    ///
-    /// Each index the memtable holds under that same spec says what it can hand
-    /// over: nothing, a stream of training rows, or a file it wrote itself. A
-    /// scalar index the memtable lacks, or holds under another definition, is
-    /// built from the generation's rows; a vector or full-text one is left out,
-    /// since only the memtable's own index can build it.
+    /// time. An index the memtable holds under the same spec hands over what it
+    /// can; a scalar one it lacks or holds differently is built from the
+    /// generation's rows, and any other is left out.
     ///
     /// Returns index metadata without committing; the caller writes a single
     /// manifest with all of it.
@@ -662,20 +662,17 @@ impl MemTableFlusher {
         dataset: &mut Dataset,
         gen_path: &Path,
         index_specs: &[MemIndexSpec],
-        mem_indexes: Option<&super::super::index::IndexStore>,
+        mem_indexes: Option<&IndexStore>,
         total_rows: usize,
-        storage_version: lance_file::version::ConcreteFileVersion,
+        storage_version: ConcreteFileVersion,
     ) -> Result<Vec<IndexMetadata>> {
-        use crate::index::CreateIndexBuilder;
-
-        let Some(registry) = mem_indexes else {
+        let Some(store) = mem_indexes else {
             return Ok(vec![]);
         };
 
-        let mut created_indexes = Vec::new();
+        let mut created = Vec::new();
         for spec in index_specs {
-            let index_type = spec.plugin.flush_index_type();
-            let outcome = match registry.index_built_from(spec) {
+            let outcome = match store.index_built_from(spec) {
                 Some(index) => {
                     let generation = GenerationWrite {
                         path: gen_path,
@@ -692,46 +689,29 @@ impl MemTableFlusher {
                         })
                         .await?
                 }
-                None if index_type.is_scalar() => FlushOutcome::BuildFromGeneration,
-                None => continue,
+                None if spec.plugin.flush_index_type().is_scalar() => {
+                    FlushOutcome::BuildFromGeneration
+                }
+                None => {
+                    debug!(index = %spec.name, "memtable does not hold this index; not flushed");
+                    continue;
+                }
             };
             let training_data = match outcome {
-                FlushOutcome::Skip => continue,
-                // The index wrote its own file; nothing left to build.
+                FlushOutcome::Skip => {
+                    debug!(index = %spec.name, "index holds nothing to flush");
+                    continue;
+                }
                 FlushOutcome::Wrote(index_meta) => {
-                    created_indexes.push(*index_meta);
+                    created.push(*index_meta);
                     continue;
                 }
                 FlushOutcome::TrainingData(stream) => Some(stream),
                 FlushOutcome::BuildFromGeneration => None,
             };
-
-            // The flush builds scalar indexes only; any other kind writes its
-            // own file. Skipping instead would flush a generation that index
-            // searches cannot see.
-            if !index_type.is_scalar() {
-                return Err(Error::invalid_input(format!(
-                    "index '{}' asked the flush to build a {index_type} index, which the flush \
-                     builds only for scalar types; plugin '{}' must write it and return \
-                     FlushOutcome::Wrote",
-                    spec.name,
-                    spec.plugin.name()
-                )));
-            }
-
-            let params = spec.plugin.flush_params(spec);
-            let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
-            let mut builder = CreateIndexBuilder::new(dataset, &columns, index_type, &params)
-                .name(spec.name.clone());
-            if let Some(stream) = training_data {
-                // Forward-written data: memtable positions line up 1:1 with
-                // the data file, so no remap is needed.
-                builder = builder.preprocessed_stream(stream, spec.plugin.training_criteria());
-            }
-            created_indexes.push(builder.execute_uncommitted().await?);
+            created.push(build_scalar_index(dataset, spec, training_data).await?);
         }
-
-        Ok(created_indexes)
+        Ok(created)
     }
 
     /// Write the standalone primary-key dedup index for this generation.
@@ -746,7 +726,7 @@ impl MemTableFlusher {
     async fn create_pk_index(
         &self,
         gen_path: &Path,
-        mem_indexes: Option<&super::super::index::IndexStore>,
+        mem_indexes: Option<&IndexStore>,
     ) -> Result<()> {
         use datafusion::physical_plan::SendableRecordBatchStream;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -758,7 +738,7 @@ impl MemTableFlusher {
         let Some(registry) = mem_indexes else {
             return Ok(());
         };
-        let batches = registry.pk_training_batches(8192)?;
+        let batches = registry.pk_training_batches(TRAINING_BATCH_SIZE)?;
         if batches.is_empty() {
             return Ok(());
         }
@@ -773,7 +753,7 @@ impl MemTableFlusher {
             schema,
             futures::stream::iter(batches.into_iter().map(Ok)),
         ));
-        train_btree_index(stream, &store, 8192, None, None).await?;
+        train_btree_index(stream, &store, TRAINING_BATCH_SIZE as u64, None, None).await?;
         Ok(())
     }
 
@@ -814,6 +794,9 @@ pub enum TriggerMemTableFlush {
     Flush {
         /// The frozen memtable to flush.
         memtable: Arc<MemTable>,
+        /// The indexes the memtable was built with. Not read from the writer,
+        /// whose set changes with the schema while this memtable keeps the old one.
+        index_specs: Arc<[MemIndexSpec]>,
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
@@ -822,14 +805,46 @@ pub enum TriggerMemTableFlush {
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Flush { memtable, done } => f
+            Self::Flush {
+                memtable,
+                index_specs,
+                done,
+            } => f
                 .debug_struct("TriggerMemTableFlush::Flush")
                 .field("memtable_gen", &memtable.generation())
                 .field("memtable_rows", &memtable.row_count())
+                .field("index_count", &index_specs.len())
                 .field("has_done", &done.is_some())
                 .finish(),
         }
     }
+}
+
+/// Build a scalar index on the generation from `training_data`, or from its
+/// rows without any.
+async fn build_scalar_index(
+    dataset: &mut Dataset,
+    spec: &MemIndexSpec,
+    training_data: Option<SendableRecordBatchStream>,
+) -> Result<IndexMetadata> {
+    let index_type = spec.plugin.flush_index_type();
+    if !index_type.is_scalar() {
+        return Err(Error::invalid_input(format!(
+            "index '{}' asked the flush to build a {index_type} index, but the flush builds \
+             only scalar types; plugin '{}' must write it and return FlushOutcome::Wrote",
+            spec.name,
+            spec.plugin.name()
+        )));
+    }
+    let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
+    let params = spec.plugin.flush_params(spec);
+    let mut builder =
+        CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
+    if let Some(stream) = training_data {
+        // Memtable positions are the flushed file's row ids, so no remap.
+        builder = builder.preprocessed_stream(stream, spec.plugin.training_criteria());
+    }
+    builder.execute_uncommitted().await
 }
 
 #[cfg(test)]
@@ -903,9 +918,6 @@ mod tests {
     }
 
     /// The shard schema these tests build their memtables against.
-    ///
-    /// A plugin resolves nested paths against this; the built-in kinds take
-    /// their columns from the spec, so the tests below only need it to exist.
     fn test_lance_schema() -> lance_core::datatypes::Schema {
         lance_core::datatypes::Schema::try_from(create_test_schema().as_ref()).unwrap()
     }
@@ -1275,98 +1287,6 @@ mod tests {
         assert_eq!(rows.get(&1), Some(&"a2".to_string()));
         assert_eq!(rows.get(&2), Some(&"b".to_string()));
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
-    }
-
-    /// A writer's index set can change while a memtable is open. Flushing it
-    /// under the new set builds each scalar index from what the memtable holds
-    /// only when it holds that index under the same definition: an index it
-    /// lacks, or holds under another column, is built from the generation's
-    /// rows, and every one of them answers like a full read.
-    #[tokio::test]
-    async fn a_flush_builds_an_index_the_memtable_holds_differently_from_its_rows() {
-        use lance_core::datatypes::Schema as LanceSchema;
-
-        use super::super::super::index::{IndexStore, MemIndexSpec};
-        use crate::index::DatasetIndexExt;
-
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let manifest_store = Arc::new(ShardManifestStore::new(
-            store.clone(),
-            &base_path,
-            shard_id,
-            2,
-        ));
-        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
-
-        let schema = create_pk_schema();
-        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
-        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
-        let mut indexes = IndexStore::from_specs(
-            &[MemIndexSpec::btree("moved", 1, "name")],
-            &lance_schema,
-            64,
-            8,
-        )
-        .unwrap();
-        indexes.enable_pk_index(&[("id".to_string(), 0)]);
-        memtable.set_indexes(indexes);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..20)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..20).map(|i| format!("n{}", i % 5)),
-                )),
-            ],
-        )
-        .unwrap();
-        let durable = memtable.insert(batch).await.unwrap() + 1;
-
-        // `moved` now covers `id` instead of `name`; `added` is new.
-        let specs = [
-            MemIndexSpec::btree("moved", 0, "id"),
-            MemIndexSpec::btree("added", 1, "name"),
-        ];
-        let flusher = MemTableFlusher::new(
-            store.clone(),
-            base_path.clone(),
-            base_uri.clone(),
-            shard_id,
-            manifest_store,
-        );
-        let result = flusher
-            .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
-            .await
-            .unwrap();
-
-        let gen_uri = format!(
-            "{}/_mem_wal/{}/{}",
-            base_uri.trim_end_matches('/'),
-            shard_id,
-            result.sstable.path
-        );
-        let dataset = Dataset::open(&gen_uri).await.unwrap();
-        let indices = dataset.load_indices().await.unwrap();
-        let fields = |name: &str| {
-            indices
-                .iter()
-                .find(|index| index.name == name)
-                .unwrap_or_else(|| panic!("{name} was built"))
-                .fields
-                .clone()
-        };
-        assert_eq!(fields("moved"), vec![0], "built on its new column");
-        assert_eq!(fields("added"), vec![1]);
-        for filter in ["id = 7", "id >= 15", "name = 'n3'"] {
-            let count = |use_index: bool| {
-                let mut scan = dataset.scan();
-                scan.filter(filter).unwrap();
-                scan.use_scalar_index(use_index);
-                async move { scan.try_into_batch().await.unwrap().num_rows() }
-            };
-            assert_eq!(count(true).await, count(false).await, "{filter}");
-        }
     }
 
     /// Flushing a memtable with a primary-key index writes a standalone sidecar
@@ -2101,101 +2021,11 @@ mod tests {
         .unwrap();
     }
 
-    /// A built-in whose flush outcome or build parameters a test overrides.
-    #[derive(Debug)]
-    struct Overriding {
-        inner: MemIndexSpec,
-        asks_for_a_build: bool,
-        params: Option<lance_index::scalar::ScalarIndexParams>,
-    }
-
-    #[derive(Debug)]
-    struct OverridingIndex(Arc<dyn crate::dataset::mem_wal::index::MemIndex>, bool);
-
-    #[async_trait::async_trait]
-    impl crate::dataset::mem_wal::index::MemIndexPlugin for Overriding {
-        fn name(&self) -> &str {
-            "Overriding"
-        }
-        fn details_message(&self) -> &str {
-            self.inner.plugin.details_message()
-        }
-        fn flush_index_type(&self) -> lance_index::IndexType {
-            self.inner.plugin.flush_index_type()
-        }
-        fn training_criteria(&self) -> lance_index::scalar::registry::TrainingCriteria {
-            self.inner.plugin.training_criteria()
-        }
-        fn flush_params(&self, spec: &MemIndexSpec) -> lance_index::scalar::ScalarIndexParams {
-            self.params
-                .clone()
-                .unwrap_or_else(|| self.inner.plugin.flush_params(spec))
-        }
-        fn validate(
-            &self,
-            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
-        ) -> Result<()> {
-            self.inner.plugin.validate(ctx)
-        }
-        fn create(
-            &self,
-            ctx: &crate::dataset::mem_wal::index::MemIndexBuildContext<'_>,
-        ) -> Result<Arc<dyn crate::dataset::mem_wal::index::MemIndex>> {
-            Ok(Arc::new(OverridingIndex(
-                self.inner.plugin.create(ctx)?,
-                self.asks_for_a_build,
-            )))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::dataset::mem_wal::index::MemIndex for OverridingIndex {
-        fn columns(&self) -> &[String] {
-            self.0.columns()
-        }
-        fn can_answer(&self, query: &dyn crate::dataset::mem_wal::index::MemQuery) -> bool {
-            self.0.can_answer(query)
-        }
-        fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
-            self.0.insert(batch, row_offset)
-        }
-        fn resident_bytes(&self) -> usize {
-            self.0.resident_bytes()
-        }
-        fn search(
-            &self,
-            query: &dyn crate::dataset::mem_wal::index::MemQuery,
-            ctx: &crate::dataset::mem_wal::index::SearchContext,
-        ) -> Result<Option<crate::dataset::mem_wal::index::MemMatches>> {
-            self.0.search(query, ctx)
-        }
-        async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
-            if self.1 {
-                Ok(FlushOutcome::BuildFromGeneration)
-            } else {
-                self.0.flush(ctx).await
-            }
-        }
-    }
-
-    fn overriding(
-        inner: MemIndexSpec,
-        asks_for_a_build: bool,
-        params: Option<lance_index::scalar::ScalarIndexParams>,
-    ) -> MemIndexSpec {
-        MemIndexSpec {
-            plugin: Arc::new(Overriding {
-                inner: inner.clone(),
-                asks_for_a_build,
-                params,
-            }),
-            ..inner
-        }
-    }
-
-    /// Flush one memtable holding `batch`, maintaining `spec`.
-    async fn flush_one(spec: MemIndexSpec, batch: RecordBatch) -> Result<FlushResult> {
-        use super::super::super::index::IndexStore;
+    /// Flush one memtable holding `batch`, maintaining `spec`, and return the
+    /// indexes the generation records.
+    async fn flush_one(spec: MemIndexSpec, batch: RecordBatch) -> Result<Vec<IndexMetadata>> {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
@@ -2211,19 +2041,58 @@ mod tests {
             lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
         let mut memtable = MemTable::new(batch.schema(), 1, vec![]).unwrap();
         memtable.set_indexes(IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap());
-        let frag_id = memtable.insert(batch).await.unwrap();
-        MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store)
-            .flush_with_indexes(&memtable, epoch, &specs, 1, frag_id + 1)
-            .await
+        let durable = memtable.insert(batch).await.unwrap() + 1;
+        let result =
+            MemTableFlusher::new(store, base_path, base_uri.clone(), shard_id, manifest_store)
+                .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+                .await?;
+        let generation = Dataset::open(&format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri.trim_end_matches('/'),
+            shard_id,
+            result.sstable.path
+        ))
+        .await?;
+        Ok(generation.load_indices().await?.as_ref().clone())
     }
 
-    /// The flush builds scalar indexes only. A vector plugin asking it to build
-    /// one is refused by name, rather than flushing a generation vector search
-    /// cannot see.
+    /// An index holding nothing writes no index: an empty list-element
+    /// full-text index is not rebuilt as a whole-row one.
+    #[tokio::test]
+    async fn an_empty_index_is_left_out_of_the_generation() {
+        use arrow_array::Array;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+        use lance_index::scalar::InvertedIndexParams;
+        use lance_index::scalar::inverted::DocumentGranularity;
+
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.append(false);
+        tags.append(true);
+        let tags = tags.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("tags", tags.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(tags)],
+        )
+        .unwrap();
+        let spec = MemIndexSpec::fts_with_params(
+            "tags_fts",
+            1,
+            "tags",
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
+        );
+        assert!(flush_one(spec, batch).await.unwrap().is_empty());
+    }
+
+    /// The flush builds only scalar indexes; a vector plugin asking it to is
+    /// refused by name.
     #[tokio::test]
     async fn a_vector_plugin_asking_the_flush_to_build_it_is_an_error() {
-        use arrow_array::FixedSizeListArray;
-        use arrow_array::Float32Array;
+        use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
+        use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_linalg::distance::DistanceType;
 
         let item = Arc::new(Field::new("item", DataType::Float32, false));
@@ -2246,10 +2115,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let spec = overriding(
+        let spec = wrapped(
             MemIndexSpec::hnsw("vector_hnsw", 1, "vector", DistanceType::L2),
-            true,
-            None,
+            Deviation::AsksForABuild,
         );
         let error = flush_one(spec, batch).await.unwrap_err();
         assert!(
@@ -2258,19 +2126,119 @@ mod tests {
         );
     }
 
+    /// After the index set changes, a flush builds from the memtable only an
+    /// index it holds under the same spec; a new or redefined scalar index is
+    /// built from the generation's rows.
+    #[tokio::test]
+    async fn a_flush_builds_an_index_the_memtable_holds_differently_from_its_rows() {
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        use super::super::super::index::{IndexStore, MemIndexSpec};
+        use crate::index::DatasetIndexExt;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let schema = create_pk_schema();
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let mut indexes = IndexStore::from_specs(
+            &[MemIndexSpec::btree("moved", 1, "name")],
+            &lance_schema,
+            64,
+            8,
+        )
+        .unwrap();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        memtable.set_indexes(indexes);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|i| format!("n{}", i % 5)),
+                )),
+            ],
+        )
+        .unwrap();
+        let durable = memtable.insert(batch).await.unwrap() + 1;
+
+        // `moved` now covers `id` instead of `name`; `added` is new.
+        let specs = [
+            MemIndexSpec::btree("moved", 0, "id"),
+            MemIndexSpec::btree("added", 1, "name"),
+        ];
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            shard_id,
+            manifest_store,
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+            .await
+            .unwrap();
+
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri.trim_end_matches('/'),
+            shard_id,
+            result.sstable.path
+        );
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let fields = |name: &str| {
+            indices
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap_or_else(|| panic!("{name} was built"))
+                .fields
+                .clone()
+        };
+        assert_eq!(fields("moved"), vec![0], "built on its new column");
+        assert_eq!(fields("added"), vec![1]);
+        for filter in ["id = 7", "id >= 15", "name = 'n3'"] {
+            let count = |use_index: bool| {
+                let mut scan = dataset.scan();
+                scan.filter(filter).unwrap();
+                scan.use_scalar_index(use_index);
+                async move { scan.try_into_batch().await.unwrap().num_rows() }
+            };
+            assert_eq!(count(true).await, count(false).await, "{filter}");
+        }
+    }
+
     /// A scalar build uses the parameters the plugin gives it: a zone size the
     /// B-tree trainer cannot read fails the build.
     #[tokio::test]
     async fn a_scalar_build_uses_the_plugin_flush_params() {
+        use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped_with_flush_params};
+
         let batch = create_test_batch(&create_test_schema(), 10);
         let params = lance_index::scalar::ScalarIndexParams {
             index_type: "btree".to_string(),
             params: Some(r#"{"zone_size": "not a number"}"#.to_string()),
         };
-        let spec = overriding(MemIndexSpec::btree("id_btree", 0, "id"), true, Some(params));
+        let spec = wrapped_with_flush_params(
+            MemIndexSpec::btree("id_btree", 0, "id"),
+            Deviation::AsksForABuild,
+            Some(params),
+        );
         assert!(flush_one(spec, batch.clone()).await.is_err());
 
-        let spec = overriding(MemIndexSpec::btree("id_btree", 0, "id"), true, None);
+        let spec = wrapped_with_flush_params(
+            MemIndexSpec::btree("id_btree", 0, "id"),
+            Deviation::AsksForABuild,
+            None,
+        );
         flush_one(spec, batch).await.unwrap();
     }
 }
