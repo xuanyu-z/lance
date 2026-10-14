@@ -43,6 +43,9 @@ use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
+use crate::blob::{blob_v2_layout, prepared_to_logical_blob_schema};
+use lance_core::datatypes::BlobV2Layout;
+
 use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
@@ -150,14 +153,16 @@ mod exec;
 mod logical_plan;
 
 /// Check a merge source against the target schema. As on append, a legacy
-/// blob input matches a Blob v2 target column; the writer converts it.
+/// blob input matches a Blob v2 target column, and a writer-prepared one is
+/// compared as the logical columns it writes; the writer converts both.
 fn check_source_schema(
     source: &lance_core::datatypes::Schema,
     target: &lance_core::datatypes::Schema,
     options: &SchemaCompareOptions,
 ) -> Result<()> {
+    let source = prepared_to_logical_blob_schema(source)?;
     source.check_compatible(target, options).or_else(|err| {
-        let source = super::promote_legacy_blob_schema(source)?;
+        let source = super::promote_legacy_blob_schema(&source)?;
         let target = super::promote_legacy_blob_schema(target)?;
         source.check_compatible(&target, options).map_err(|_| err)
     })
@@ -171,6 +176,11 @@ pub(crate) fn canonical_source_schema(
     target: &Schema,
 ) -> std::result::Result<Schema, ArrowError> {
     fn canonical_field(source: &Field, target: &Field) -> std::result::Result<Field, ArrowError> {
+        // A writer-prepared blob carries more than the logical columns it
+        // writes, and the writer needs all of it.
+        if blob_v2_layout(source) == Some(BlobV2Layout::Prepared) {
+            return Ok(source.clone());
+        }
         let data_type = match (source.data_type(), target.data_type()) {
             (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
                 let fields = target_fields
