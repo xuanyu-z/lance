@@ -4632,10 +4632,11 @@ impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
 
         let result = self.do_flush(source, end_batch_position).await;
 
-        // Record the just-appended WAL entry position in the writer state. A
-        // freeze stamps it on the outgoing memtable, and the memtable flush
-        // falls back to that stamp when the memtable's store recorded no
-        // append of its own.
+        // Propagate the just-appended WAL entry position back into the
+        // writer state so a subsequent MemTable freeze can stamp the
+        // correct `covered_wal_entry_position` into the manifest. Without
+        // this, `replay_after_wal_entry_position` stays at 0 and replay
+        // re-reads already-flushed entries after restart.
         //
         // Always update state before signalling the completion cell so any
         // waiter that reads state immediately after the cell fires sees
@@ -4906,19 +4907,22 @@ impl MemTableFlushHandler {
             // strict ordering of WAL entries. If the freeze didn't trigger a
             // flush (no pending WAL range), there's no completion cell and the
             // memtable was already WAL-flushed by an earlier put.
-            if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
-                match completion_reader.await_value().await {
-                    Some(Ok(_)) => {}
-                    // Rebuild the typed error so a fence/poison reason
-                    // propagates to the memtable-flush caller too.
-                    Some(Err(e)) => return Err(e.into_error()),
-                    None => {
-                        return Err(Error::io(
-                            "WAL flush handler exited before reporting completion",
-                        ));
+            let wal_flushed_position =
+                if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
+                    match completion_reader.await_value().await {
+                        Some(Ok(flush_result)) => flush_result.entry.map(|e| e.position),
+                        // Rebuild the typed error so a fence/poison reason
+                        // propagates to the memtable-flush caller too.
+                        Some(Err(e)) => return Err(e.into_error()),
+                        None => {
+                            return Err(Error::io(
+                                "WAL flush handler exited before reporting completion",
+                            ));
+                        }
                     }
-                }
-            }
+                } else {
+                    None
+                };
 
             // Step 1b: Wait until index application covers this whole memtable.
             //
@@ -4943,14 +4947,14 @@ impl MemTableFlushHandler {
             }
 
             // Step 2: Flush the memtable to Lance storage. The covered WAL
-            // entry position is the last entry holding this memtable's
-            // batches, recorded on its store by the append. A memtable nothing
-            // was appended for, such as one rebuilt by replay, falls back to
-            // its freeze-time marker. Stamping this into the manifest is what
-            // lets replay-on-reopen skip entries this generation covers.
-            let covered_wal_entry_position = memtable
-                .batch_store()
-                .last_wal_entry_position()
+            // entry position is either the one we just appended (per-memtable,
+            // from the completion cell — authoritative even when concurrent
+            // flushes have raced ahead in `state.last_flushed_wal_entry_position`)
+            // or, when no flush was triggered at freeze time, the memtable's
+            // frozen-at marker captured at freeze. Stamping this into the
+            // manifest is what lets replay-on-reopen skip entries this
+            // generation covers.
+            let covered_wal_entry_position = wal_flushed_position
                 .or_else(|| memtable.frozen_at_wal_entry_position())
                 .unwrap_or(0);
             // Rebuild secondary indexes on the SSTable so later
@@ -10445,10 +10449,11 @@ mod tests {
     }
 
     /// A memtable frozen after its batches were appended, but before the
-    /// writer state recorded that append, records the append's WAL position
-    /// as covered, so reopen replays only the generation after it.
+    /// writer state recorded that append, flushes with a covered position
+    /// short of the append. Reopen replays that entry and skips it by its
+    /// generation, restoring only the generation after it.
     #[tokio::test]
-    async fn test_flush_covers_append_not_yet_recorded_in_writer_state() {
+    async fn test_reopen_after_flush_with_stale_covered_position() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = schema_with_pk();
         let shard_id = Uuid::new_v4();
@@ -10482,8 +10487,8 @@ mod tests {
 
         let manifest = writer_a.manifest().await.unwrap().unwrap();
         assert_eq!(
-            manifest.replay_after_wal_entry_position, 1,
-            "the flushed generation's rows are in WAL entry 1"
+            manifest.replay_after_wal_entry_position, 0,
+            "the covered position must miss WAL entry 1 for reopen to replay it"
         );
 
         // Fill the next generation to just under the cap, then crash.
