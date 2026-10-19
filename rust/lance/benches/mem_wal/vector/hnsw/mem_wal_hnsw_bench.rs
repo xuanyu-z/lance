@@ -44,6 +44,11 @@ struct Args {
     /// Rows per `insert_batch` call; 0 inserts every row in one call. A
     /// MemTable inserts one write's rows at a time.
     batch_rows: usize,
+    /// Threads that touch an `ArcSwap` once before the build. arc-swap keeps
+    /// a node per thread that ever loaded through it, and dropping or storing
+    /// an `ArcSwap` walks that list, so its cost grows with the process's
+    /// thread count. A server process has a hundred or more.
+    arc_swap_threads: usize,
 }
 
 impl Default for Args {
@@ -66,6 +71,7 @@ impl Default for Args {
             query_seconds: 0.0,
             capacity: 0,
             batch_rows: 0,
+            arc_swap_threads: 0,
         }
     }
 }
@@ -121,6 +127,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let snapshot = store.snapshot();
     let arrow_s = arrow_start.elapsed().as_secs_f64();
 
+    // Register `arc_swap_threads` threads with arc-swap's debt list, as a
+    // server's runtime and worker threads are.
+    let touched = arc_swap::ArcSwap::from_pointee(0u8);
+    std::thread::scope(|scope| {
+        for _ in 0..args.arc_swap_threads {
+            scope.spawn(|| drop(touched.load()));
+        }
+    });
+
     let params = BuildParams::default()
         .num_edges(args.m)
         .ef_construction(args.ef_construction)
@@ -132,8 +147,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let insert_start = Instant::now();
     let mut insert_passes: u64 = 0;
     let mut insert_core = std::time::Duration::ZERO;
-    let graph = loop {
+    let (graph, try_new_s) = loop {
+        let alloc = Instant::now();
         let g = HnswGraph::try_new(capacity, params.clone())?;
+        let try_new_s = alloc.elapsed().as_secs_f64();
         let core = Instant::now();
         let step = if args.batch_rows == 0 {
             args.rows
@@ -150,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         insert_passes += 1;
         if args.insert_seconds <= 0.0 || insert_start.elapsed().as_secs_f64() >= args.insert_seconds
         {
-            break g;
+            break (g, try_new_s);
         }
     };
     let insert_s = insert_start.elapsed().as_secs_f64();
@@ -210,6 +227,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .sum();
     let truth_s = truth_start.elapsed().as_secs_f64();
     let recall_at_k = recall_hits as f64 / (args.truth_queries * args.k) as f64;
+
+    // What a MemTable holds for the graph, and what freeing it costs.
+    let resident_bytes = graph.resident_bytes();
+    let drop_start = Instant::now();
+    drop(graph);
+    let drop_s = drop_start.elapsed().as_secs_f64();
+    println!(
+        "lifecycle impl=lance_hnsw rows={} capacity={} arc_swap_threads={} try_new_s={:.6} resident_bytes={} drop_s={:.6}",
+        args.rows, capacity, args.arc_swap_threads, try_new_s, resident_bytes, drop_s
+    );
 
     println!(
         "result impl=lance_hnsw rows={} dim={} generate_s={:.6} arrow_s={:.6} insert_s={:.6} insert_passes={} insert_qps={:.3} insert_core_s={:.6} insert_core_qps={:.3} query_s={:.6} query_passes={} query_qps={:.3} truth_s={:.6} recall_at_{}={:.6} self_recall_at_{}={:.6}",
@@ -280,6 +307,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--query-seconds" => args.query_seconds = value.parse()?,
             "--capacity" => args.capacity = value.parse()?,
             "--batch-rows" => args.batch_rows = value.parse()?,
+            "--arc-swap-threads" => args.arc_swap_threads = value.parse()?,
             _ => return Err(format!("unknown argument: {flag}").into()),
         }
     }
