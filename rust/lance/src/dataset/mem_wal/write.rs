@@ -982,10 +982,11 @@ impl ShardMemory {
         }
     }
 
-    /// Bytes of generations the grace sweeper has evicted from the view and is
-    /// still freeing. Freeing a large generation takes seconds, and it runs off
-    /// the writer lock, so writes continue meanwhile; these bytes stay counted
-    /// until the free returns. `0` in WAL-only mode.
+    /// Bytes of generations the grace sweeper has evicted from the view that
+    /// are still allocated: being freed off the writer lock (seconds, for a
+    /// large generation), or still held by a scan. Each part (batches,
+    /// indexes, the memtable's own bloom filter) leaves this count when its
+    /// last reference is freed. `0` in WAL-only mode.
     pub fn freeing_bytes(&self) -> usize {
         match &self.source {
             ShardMemorySource::MemTables(t) => t.load().freeing.load(Ordering::Acquire),
@@ -1362,11 +1363,12 @@ struct ResidentMemTables {
     /// [`ShardMemory::retained_bytes`] alongside
     /// [`ShardMemory::unflushed_bytes`].
     grace: Vec<InMemoryMemTableRef>,
-    /// Bytes of generations the grace sweep has evicted and is still freeing
-    /// off the writer lock. Shared by every snapshot of a shard: the sweep adds
-    /// a generation's bytes before it leaves `grace`, and the task freeing it
-    /// subtracts them once the drop returns, so those bytes are never out of
-    /// the view while they are still allocated.
+    /// Bytes of generations the grace sweep has evicted that are still
+    /// allocated. Shared by every snapshot of a shard: the sweep charges each
+    /// part of a generation before it leaves `grace`, and each part gives its
+    /// bytes back when its own last reference is freed (see
+    /// [`charge_until_freed`]), so those bytes are never out of the view while
+    /// they are still allocated, and never counted twice.
     freeing: Arc<AtomicUsize>,
     /// The oldest flush still outstanding, or `None` when none is.
     ///
@@ -4991,27 +4993,41 @@ async fn sweep_expired_frozen(
         if expired.is_empty() {
             return;
         }
-        // The evicted generations leave `grace` here, but they are still
-        // allocated until the drop below returns. Move their bytes to
-        // `freeing` first, so the view never reads them as reclaimed: a
-        // budget that did would admit writes into memory that is still held.
-        let bytes: usize = expired
-            .iter()
-            .map(|frozen| in_memory_ref(&frozen.memtable).resident_bytes())
-            .sum();
+        // The evicted generations leave `grace` here, but they stay allocated
+        // until the last reference to each part is gone, which may be a scan
+        // still reading them, long after the drop below. So before they leave
+        // `grace`, charge each part's bytes to `freeing`, and let the part give
+        // them back when it is itself freed: the view never reads memory that
+        // is still held as reclaimed, and never counts it twice.
         let freeing = Arc::clone(&memory.load().freeing);
-        freeing.fetch_add(bytes, Ordering::AcqRel);
+        for frozen in &expired {
+            charge_until_freed(&frozen.memtable, &freeing);
+        }
         // The replaced snapshot still references the evicted generations, so
         // it is freed with them rather than here.
         let previous = swap_memory(memory, &state);
-        (expired, previous, freeing, bytes)
+        (expired, previous)
     };
-    free_off_runtime(move || {
-        let (expired, previous, freeing, bytes) = evicted;
-        drop(expired);
-        drop(previous);
-        freeing.fetch_sub(bytes, Ordering::AcqRel);
-    });
+    free_off_runtime(move || drop(evicted));
+}
+
+/// Charge `memtable`'s resident bytes to `freeing`, each part on the owner
+/// that frees it: row data on the batch store, index bytes on the index store,
+/// the primary-key bloom filter on the memtable. The parts are shared
+/// separately (a scan can hold a batch store or index store without the
+/// memtable), so each gives its share back when its own last reference goes.
+fn charge_until_freed(memtable: &MemTable, freeing: &Arc<AtomicUsize>) {
+    let parts = in_memory_ref(memtable);
+    parts
+        .batch_store
+        .charge_until_freed(freeing, parts.retained_row_bytes());
+    if let Some(indexes) = memtable.indexes_arc() {
+        indexes.charge_until_freed(freeing, indexes.resident_bytes());
+    }
+    memtable.charge_until_freed(
+        freeing,
+        crate::dataset::mem_wal::memtable::pk_bloom_filter_bytes(),
+    );
 }
 
 /// Run `free` on the blocking pool, or here when there is no runtime.
@@ -12027,9 +12043,12 @@ mod tests {
         let before = drops_started.load(Ordering::SeqCst);
         writer.force_freeze_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
-        // The flushed generation, lingering out its grace.
-        let generation = writer.memory().grace_bytes();
-        assert!(generation > 0, "the flushed generation must be in the view");
+        // The flushed generation, lingering out its grace. Its parts are freed
+        // one by one; the index store, whose index is slow to drop, goes last.
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let indexes = refs.frozen[0].index_store.resident_bytes();
+        drop(refs);
+        assert!(indexes > 0, "the flushed generation must hold index bytes");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while drops_started.load(Ordering::SeqCst) == before {
@@ -12039,14 +12058,14 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // Mid-drop: the generation is still allocated.
+        // Mid-drop: the index store is still allocated.
         let memory = writer.memory();
         assert!(
-            memory.grace_bytes() >= generation && memory.retained_bytes() >= generation,
-            "the view dropped an evicted generation of {generation} bytes while it was \
-             still being freed: grace {} retained {}",
+            memory.grace_bytes() >= indexes && memory.freeing_bytes() >= indexes,
+            "the view dropped {indexes} bytes of indexes while they were still being \
+             freed: grace {} freeing {}",
             memory.grace_bytes(),
-            memory.retained_bytes()
+            memory.freeing_bytes()
         );
 
         // Once the drop returns the bytes leave the view.
@@ -12058,6 +12077,76 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(writer.memory().grace_bytes(), 0);
+
+        writer.close().await.unwrap();
+    }
+
+    /// A scan can still hold an evicted generation's batches and indexes after
+    /// the sweep has dropped its own references. That memory is still
+    /// allocated, so the view must keep counting it until the scan lets go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_memory_view_counts_an_evicted_generation_a_scan_still_holds() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            frozen_memtable_grace: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            index_specs,
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1000)])
+            .await
+            .unwrap();
+        writer.force_freeze_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        // What a scan holds while it reads the generation: its batch store and
+        // index store, not the memtable itself (whose bloom filter goes with
+        // the sweep's own free).
+        let scan = writer.in_memory_memtable_refs().await.unwrap();
+        let held =
+            scan.frozen[0].retained_row_bytes() + scan.frozen[0].index_store.resident_bytes();
+        assert!(held > 0, "the scan must hold the generation's bytes");
+
+        // Let the sweep evict it and its own free run to completion.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while writer.memtable_stats().await.unwrap().frozen_count > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the grace sweep never evicted the flushed generation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let memory = writer.memory();
+        assert_eq!(
+            memory.freeing_bytes(),
+            held,
+            "the view must count exactly the {held} bytes a scan still holds"
+        );
+
+        // Once the scan lets go, the bytes leave the view.
+        drop(scan);
+        assert_eq!(writer.memory().freeing_bytes(), 0);
         assert_eq!(writer.memory().grace_bytes(), 0);
 
         writer.close().await.unwrap();

@@ -426,3 +426,45 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Release Charge
+// ============================================================================
+
+/// Bytes an owner gives back to a shared count when it is freed.
+///
+/// Set at most once. Its `Drop` subtracts the bytes, so an owner that holds
+/// it as its **last** field gives them back only after everything else it
+/// owns has been freed, on whichever thread drops the last reference.
+#[derive(Debug, Default)]
+pub(crate) struct ReleaseCharge(
+    std::sync::OnceLock<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
+);
+
+impl ReleaseCharge {
+    /// Add `bytes` to `count` now and take them back out when this is
+    /// dropped. Returns false, and changes nothing, if a charge is already set.
+    pub(crate) fn charge(
+        &self,
+        count: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        bytes: usize,
+    ) -> bool {
+        if self.0.get().is_some() {
+            return false;
+        }
+        count.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        if self.0.set((std::sync::Arc::clone(count), bytes)).is_err() {
+            count.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+}
+
+impl Drop for ReleaseCharge {
+    fn drop(&mut self) {
+        if let Some((count, bytes)) = self.0.get() {
+            count.fetch_sub(*bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}

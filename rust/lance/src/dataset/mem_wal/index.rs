@@ -32,6 +32,7 @@ use lance_linalg::distance::DistanceType;
 use tracing::instrument;
 
 use super::memtable::batch_store::StoredBatch;
+use super::util::ReleaseCharge;
 use super::wal::WriterCursors;
 use pk::{OwnedPk, PkIndex};
 
@@ -182,6 +183,9 @@ pub struct IndexStore {
     /// Whether any row has reached the indexes; an index added after would
     /// miss it.
     has_rows: AtomicBool,
+    /// Gives this store's bytes back to a shard's `freeing` count once the
+    /// store is freed. Last, so it drops after the indexes above.
+    release: ReleaseCharge,
 }
 
 impl std::fmt::Debug for IndexStore {
@@ -238,6 +242,12 @@ impl IndexStore {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Count `bytes` in `count` until this store is freed. See
+    /// [`ReleaseCharge`].
+    pub(crate) fn charge_until_freed(&self, count: &Arc<AtomicUsize>, bytes: usize) -> bool {
+        self.release.charge(count, bytes)
     }
 
     /// Build every index a memtable is to maintain. `max_rows` and
