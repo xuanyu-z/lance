@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -962,15 +962,33 @@ impl ShardMemory {
     ///
     /// Real memory, but no flush reclaims it — the sweeper does, on a timer. A
     /// waiter that blocks on this is waiting for the clock, not for a flush.
+    /// Includes [`Self::freeing_bytes`]: generations the sweeper has evicted
+    /// but not yet finished freeing are still allocated.
     /// `0` in WAL-only mode, and `0` under the default zero grace.
     pub fn grace_bytes(&self) -> usize {
         match &self.source {
-            ShardMemorySource::MemTables(t) => t
-                .load()
-                .grace
-                .iter()
-                .map(InMemoryMemTableRef::resident_bytes)
-                .sum(),
+            ShardMemorySource::MemTables(t) => {
+                let tables = t.load();
+                tables
+                    .grace
+                    .iter()
+                    .map(InMemoryMemTableRef::resident_bytes)
+                    .sum::<usize>()
+                    + tables.freeing.load(Ordering::Acquire)
+            }
+            ShardMemorySource::Queue(_) => 0,
+            #[cfg(test)]
+            ShardMemorySource::Fake(_) => 0,
+        }
+    }
+
+    /// Bytes of generations the grace sweeper has evicted from the view and is
+    /// still freeing. Freeing a large generation takes seconds, and it runs off
+    /// the writer lock, so writes continue meanwhile; these bytes stay counted
+    /// until the free returns. `0` in WAL-only mode.
+    pub fn freeing_bytes(&self) -> usize {
+        match &self.source {
+            ShardMemorySource::MemTables(t) => t.load().freeing.load(Ordering::Acquire),
             ShardMemorySource::Queue(_) => 0,
             #[cfg(test)]
             ShardMemorySource::Fake(_) => 0,
@@ -1003,7 +1021,8 @@ impl ShardMemory {
     }
 
     /// Every resident byte the shard is holding: [`Self::unflushed_bytes`] plus
-    /// the generations already flushed but still inside `frozen_memtable_grace`.
+    /// the generations already flushed but still inside `frozen_memtable_grace`,
+    /// plus those evicted but still being freed ([`Self::freeing_bytes`]).
     ///
     /// This is the figure a process-wide budget wants. `unflushed_bytes` is the
     /// narrower one — what a flush can still reclaim — and is what the per-shard
@@ -1024,6 +1043,7 @@ impl ShardMemory {
                         .chain(tables.grace.iter())
                         .map(InMemoryMemTableRef::resident_bytes)
                         .sum::<usize>()
+                    + tables.freeing.load(Ordering::Acquire)
             }
             ShardMemorySource::Queue(q) => q.queue_bytes(),
             #[cfg(test)]
@@ -1042,8 +1062,14 @@ impl ShardMemory {
                 let tables = t.load();
                 match tables.oldest_flush.clone() {
                     Some(flush) => Drain::Flush(flush),
-                    // The sweeper will drop these once their grace elapses.
-                    None if !tables.grace.is_empty() => Drain::Background,
+                    // The sweeper will drop these once their grace elapses, and
+                    // a generation it is still freeing returns its bytes when
+                    // the free completes.
+                    None if !tables.grace.is_empty()
+                        || tables.freeing.load(Ordering::Acquire) > 0 =>
+                    {
+                        Drain::Background
+                    }
                     None => Drain::Stalled,
                 }
             }
@@ -1336,6 +1362,12 @@ struct ResidentMemTables {
     /// [`ShardMemory::retained_bytes`] alongside
     /// [`ShardMemory::unflushed_bytes`].
     grace: Vec<InMemoryMemTableRef>,
+    /// Bytes of generations the grace sweep has evicted and is still freeing
+    /// off the writer lock. Shared by every snapshot of a shard: the sweep adds
+    /// a generation's bytes before it leaves `grace`, and the task freeing it
+    /// subtracts them once the drop returns, so those bytes are never out of
+    /// the view while they are still allocated.
+    freeing: Arc<AtomicUsize>,
     /// The oldest flush still outstanding, or `None` when none is.
     ///
     /// Deliberately not backfilled with the active memtable's watcher. That
@@ -1376,6 +1408,7 @@ fn swap_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) -> Arc<
         active: Some(in_memory_ref(&state.memtable)),
         frozen: refs(frozen),
         grace: refs(grace),
+        freeing: Arc::clone(&memory.load().freeing),
         // Oldest first, so the front of the queue is what a waiter parks on.
         oldest_flush: state.frozen_flush_watchers.front().cloned(),
     }))
@@ -4915,22 +4948,36 @@ async fn sweep_expired_frozen(
         if expired.is_empty() {
             return;
         }
-        // Eviction is the only thing that reclaims a grace-retained generation,
-        // so this is where its bytes leave the memory view. The replaced
-        // snapshot still references the evicted generations, so it is freed
-        // with them rather than here.
-        (expired, swap_memory(memory, &state))
+        // The evicted generations leave `grace` here, but they are still
+        // allocated until the drop below returns. Move their bytes to
+        // `freeing` first, so the view never reads them as reclaimed: a
+        // budget that did would admit writes into memory that is still held.
+        let bytes: usize = expired
+            .iter()
+            .map(|frozen| in_memory_ref(&frozen.memtable).resident_bytes())
+            .sum();
+        let freeing = Arc::clone(&memory.load().freeing);
+        freeing.fetch_add(bytes, Ordering::AcqRel);
+        // The replaced snapshot still references the evicted generations, so
+        // it is freed with them rather than here.
+        let previous = swap_memory(memory, &state);
+        (expired, previous, freeing, bytes)
     };
-    free_off_runtime(evicted);
+    free_off_runtime(move || {
+        let (expired, previous, freeing, bytes) = evicted;
+        drop(expired);
+        drop(previous);
+        freeing.fetch_sub(bytes, Ordering::AcqRel);
+    });
 }
 
-/// Drop `garbage` on the blocking pool, or here when there is no runtime.
-fn free_off_runtime<T: Send + 'static>(garbage: T) {
+/// Run `free` on the blocking pool, or here when there is no runtime.
+fn free_off_runtime(free: impl FnOnce() + Send + 'static) {
     match tokio::runtime::Handle::try_current() {
         Ok(runtime) => {
-            runtime.spawn_blocking(move || drop(garbage));
+            runtime.spawn_blocking(free);
         }
-        Err(_) => drop(garbage),
+        Err(_) => free(),
     }
 }
 
@@ -11736,9 +11783,7 @@ mod tests {
     /// releasing it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_grace_sweep_frees_evicted_generation_without_blocking_puts() {
-        use crate::dataset::mem_wal::index::test_plugin::{
-            Deviation, SLOW_DROP, slow_drops_started, wrapped,
-        };
+        use crate::dataset::mem_wal::index::test_plugin::{SLOW_DROP, slow_to_drop};
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
@@ -11754,10 +11799,8 @@ mod tests {
             ..Default::default()
         };
         // Stands in for an index that is slow to free, as a large HNSW graph is.
-        let index_specs = vec![wrapped(
-            MemIndexSpec::btree("id_idx", 0, "id"),
-            Deviation::SlowToDrop,
-        )];
+        let (spec, drops_started) = slow_to_drop(MemIndexSpec::btree("id_idx", 0, "id"));
+        let index_specs = vec![spec];
         let writer = ShardWriter::open(
             store,
             base_path,
@@ -11773,13 +11816,13 @@ mod tests {
             .put(vec![create_test_batch(&schema, 0, 10)])
             .await
             .unwrap();
-        let before = slow_drops_started();
+        let before = drops_started.load(Ordering::SeqCst);
         writer.force_freeze_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
 
         // Wait for the sweep to evict the flushed generation and start freeing it.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while slow_drops_started() == before {
+        while drops_started.load(Ordering::SeqCst) == before {
             assert!(
                 Instant::now() < deadline,
                 "the grace sweep never evicted the flushed generation"
@@ -11797,6 +11840,82 @@ mod tests {
             waited < SLOW_DROP / 2,
             "a put waited {waited:?} for the sweep to free an evicted generation"
         );
+
+        writer.close().await.unwrap();
+    }
+
+    /// The sweep frees an evicted generation off the writer lock, which takes
+    /// as long as the drop does. Until the drop returns the generation is still
+    /// allocated, so the memory view a budget reads must keep counting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_memory_view_counts_an_evicted_generation_until_it_is_freed() {
+        use crate::dataset::mem_wal::index::test_plugin::{SLOW_DROP, slow_to_drop};
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            frozen_memtable_grace: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (spec, drops_started) = slow_to_drop(MemIndexSpec::btree("id_idx", 0, "id"));
+        let index_specs = vec![spec];
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            index_specs,
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1000)])
+            .await
+            .unwrap();
+        let before = drops_started.load(Ordering::SeqCst);
+        writer.force_freeze_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        // The flushed generation, lingering out its grace.
+        let generation = writer.memory().grace_bytes();
+        assert!(generation > 0, "the flushed generation must be in the view");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while drops_started.load(Ordering::SeqCst) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the grace sweep never evicted the flushed generation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Mid-drop: the generation is still allocated.
+        let memory = writer.memory();
+        assert!(
+            memory.grace_bytes() >= generation && memory.retained_bytes() >= generation,
+            "the view dropped an evicted generation of {generation} bytes while it was \
+             still being freed: grace {} retained {}",
+            memory.grace_bytes(),
+            memory.retained_bytes()
+        );
+
+        // Once the drop returns the bytes leave the view.
+        let deadline = Instant::now() + SLOW_DROP * 3;
+        while writer.memory().freeing_bytes() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the freed generation never left the view"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(writer.memory().grace_bytes(), 0);
 
         writer.close().await.unwrap();
     }
