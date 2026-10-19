@@ -11702,6 +11702,80 @@ mod tests {
         );
     }
 
+    /// Two concurrent upserts inserting disjoint sets of new keys must rebase
+    /// rather than conflict. The key filters of a few hundred keys each share
+    /// set bits almost surely, so a "shared bit" test made every such pair a
+    /// retryable conflict, and the loser re-ran its whole join and rewrite.
+    #[tokio::test]
+    async fn test_concurrent_insert_disjoint_new_keys_rebase() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_string(),
+                    "true".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        let keys = |range: std::ops::Range<u32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(range.clone())),
+                    Arc::new(UInt32Array::from_iter_values(range.map(|_| 1))),
+                ],
+            )
+            .unwrap()
+        };
+        let upsert = |retries: u32| {
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .conflict_retries(retries)
+                .try_build()
+                .unwrap()
+        };
+
+        // Both planned against version 1; the second may not retry, so it
+        // only lands if it rebases over the first.
+        let second = upsert(0);
+        let batch = keys(1_000..1_500);
+        upsert(10)
+            .execute(Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(vec![Ok(batch)]),
+            )) as SendableRecordBatchStream)
+            .await
+            .expect("first upsert");
+        let batch = keys(100_000..100_500);
+        let (merged, _) = second
+            .execute(Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(vec![Ok(batch)]),
+            )) as SendableRecordBatchStream)
+            .await
+            .expect("disjoint inserts must rebase, not conflict");
+        assert_eq!(merged.count_rows(None).await.unwrap(), 1_004);
+    }
+
     /// Concurrency regression for lance-format/lance#6441: two concurrent
     /// find-or-create jobs (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`)
     /// both try to insert the same fresh key. The second must fail with
