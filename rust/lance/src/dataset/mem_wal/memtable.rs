@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::MemTableDataTarget;
 use super::index::IndexStore;
-use super::util::{WatchableOnceCell, WatchableOnceCellReader};
+use super::util::{ReleaseCharge, WatchableOnceCell, WatchableOnceCellReader};
 use super::wal::WalFlushFailure;
 use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
@@ -125,6 +125,11 @@ pub struct MemTable {
     /// Created when the memtable is frozen and set with a value when the flush completes.
     /// Used by backpressure to wait for oldest memtable flush completion.
     memtable_flush_completion: std::sync::Mutex<Option<WatchableOnceCell<DurabilityResult>>>,
+
+    /// Gives this memtable's own bytes (its primary-key bloom filter) back to a
+    /// shard's `freeing` count once it is freed. Last, so it drops after the
+    /// fields above.
+    release: ReleaseCharge,
 }
 
 /// Cached Dataset with timestamp for eventual consistency.
@@ -320,7 +325,18 @@ impl MemTable {
             frozen_at_wal_entry_position: None,
             wal_flush_completion: std::sync::Mutex::new(None),
             memtable_flush_completion: std::sync::Mutex::new(Some(memtable_flush_cell)),
+            release: ReleaseCharge::default(),
         })
+    }
+
+    /// Count `bytes` in `count` until this memtable is freed. See
+    /// [`ReleaseCharge`].
+    pub(crate) fn charge_until_freed(
+        &self,
+        count: &Arc<std::sync::atomic::AtomicUsize>,
+        bytes: usize,
+    ) -> bool {
+        self.release.charge(count, bytes)
     }
 
     /// Set the index registry for indexed writes.

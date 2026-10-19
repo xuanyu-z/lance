@@ -43,8 +43,8 @@
 use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
@@ -54,6 +54,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::dataset::blob::BlobPreprocessor;
 use crate::dataset::mem_wal::MemTableDataTarget;
+use crate::dataset::mem_wal::util::ReleaseCharge;
 
 #[derive(Default)]
 pub(crate) struct BlobPreprocessorState {
@@ -296,6 +297,10 @@ pub struct BatchStore {
     /// Generation-scoped Blob v2 writer. Durable puts reuse its current pack;
     /// the WAL path finishes it before persisting any descriptors that reference it.
     blob_preprocessor: AsyncMutex<BlobPreprocessorState>,
+
+    /// Gives this store's bytes back to a shard's `freeing` count once the
+    /// store is freed. Last, so it drops after everything above.
+    release: ReleaseCharge,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -366,7 +371,14 @@ impl BatchStore {
             target,
             generation,
             blob_preprocessor: AsyncMutex::new(BlobPreprocessorState::default()),
+            release: ReleaseCharge::default(),
         }
+    }
+
+    /// Count `bytes` in `count` until this store is freed. See
+    /// [`ReleaseCharge`].
+    pub(crate) fn charge_until_freed(&self, count: &Arc<AtomicUsize>, bytes: usize) -> bool {
+        self.release.charge(count, bytes)
     }
 
     /// The memtable generation these batches belong to.
