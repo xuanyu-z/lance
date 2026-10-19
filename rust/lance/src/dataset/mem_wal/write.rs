@@ -1355,6 +1355,13 @@ struct ResidentMemTables {
 /// Cheap: two `Arc` clones per live memtable, no byte walk — the totals are
 /// computed on read.
 fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) {
+    drop(swap_memory(memory, state));
+}
+
+/// [`publish_memory`], handing back the snapshot it replaced so the caller
+/// decides where that snapshot is freed. When it holds the last reference to an
+/// evicted generation, freeing it frees the generation's indexes.
+fn swap_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) -> Arc<ResidentMemTables> {
     let (grace, frozen) = state
         .frozen_memtables
         .iter()
@@ -1365,13 +1372,13 @@ fn publish_memory(memory: &ArcSwap<ResidentMemTables>, state: &WriterState) {
             .map(|frozen| in_memory_ref(&frozen.memtable))
             .collect()
     };
-    memory.store(Arc::new(ResidentMemTables {
+    memory.swap(Arc::new(ResidentMemTables {
         active: Some(in_memory_ref(&state.memtable)),
         frozen: refs(frozen),
         grace: refs(grace),
         // Oldest first, so the front of the queue is what a waiter parks on.
         oldest_flush: state.frozen_flush_watchers.front().cloned(),
-    }));
+    }))
 }
 
 /// ShardWriter state shared across tasks.
@@ -4922,6 +4929,14 @@ impl MemTableFlushHandler {
 ///
 /// A free function so the sweeper task can call it without owning the flush
 /// handler — see [`TaskExecutor::add_periodic`] for why it must not run there.
+///
+/// The evicted generations are freed after the writer lock is released, on the
+/// blocking pool. Freeing one is not cheap: an HNSW index drops an `ArcSwap`
+/// per level of every node it preallocated (up to the memtable's row cap), and
+/// each of those drops walks arc-swap's debt list. That is seconds of CPU per
+/// generation at a million-row cap. Every put takes this lock, and
+/// so does the WAL flush timer, so freeing under it stalls every write to the
+/// shard for that long, once per generation.
 async fn sweep_expired_frozen(
     state: &Arc<RwLock<WriterState>>,
     memory: &Arc<ArcSwap<ResidentMemTables>>,
@@ -4929,18 +4944,36 @@ async fn sweep_expired_frozen(
 ) {
     let now = now_millis();
     let grace_ms = grace.as_millis() as u64;
-    let mut state = state.write().await;
-    let before = state.frozen_memtables.len();
-    state
-        .frozen_memtables
-        .retain(|frozen| match frozen.flushed_at_ms {
-            Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
-            None => true,
-        });
-    // Eviction is the only thing that reclaims a grace-retained generation,
-    // so this is where its bytes leave the memory view.
-    if state.frozen_memtables.len() != before {
-        publish_memory(memory, &state);
+    let evicted = {
+        let mut state = state.write().await;
+        let (expired, kept): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut state.frozen_memtables)
+                .into_iter()
+                .partition(|frozen| {
+                    frozen
+                        .flushed_at_ms
+                        .is_some_and(|flushed_at| now.saturating_sub(flushed_at) >= grace_ms)
+                });
+        state.frozen_memtables = kept;
+        if expired.is_empty() {
+            return;
+        }
+        // Eviction is the only thing that reclaims a grace-retained generation,
+        // so this is where its bytes leave the memory view. The replaced
+        // snapshot still references the evicted generations, so it is freed
+        // with them rather than here.
+        (expired, swap_memory(memory, &state))
+    };
+    free_off_runtime(evicted);
+}
+
+/// Drop `garbage` on the blocking pool, or here when there is no runtime.
+fn free_off_runtime<T: Send + 'static>(garbage: T) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(move || drop(garbage));
+        }
+        Err(_) => drop(garbage),
     }
 }
 
@@ -11835,6 +11868,77 @@ mod tests {
         assert!(
             refs.frozen.is_empty(),
             "frozen handle must be swept once the grace elapses"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Evicting a grace-expired generation frees its in-memory indexes, which
+    /// can take seconds. A put arriving meanwhile must not wait for that: puts
+    /// take the writer lock, so the sweep has to free the generation after
+    /// releasing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_grace_sweep_frees_evicted_generation_without_blocking_puts() {
+        use crate::dataset::mem_wal::index::test_plugin::{
+            Deviation, SLOW_DROP, slow_drops_started, wrapped,
+        };
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            frozen_memtable_grace: Duration::from_millis(50),
+            ..Default::default()
+        };
+        // Stands in for an index that is slow to free, as a large HNSW graph is.
+        let index_specs = vec![wrapped(
+            MemIndexSpec::btree("id_idx", 0, "id"),
+            Deviation::SlowToDrop,
+        )];
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            config,
+            schema.clone(),
+            index_specs,
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        let before = slow_drops_started();
+        writer.force_freeze_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        // Wait for the sweep to evict the flushed generation and start freeing it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slow_drops_started() == before {
+            assert!(
+                Instant::now() < deadline,
+                "the grace sweep never evicted the flushed generation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let put_started = Instant::now();
+        writer
+            .put(vec![create_test_batch(&schema, 10, 10)])
+            .await
+            .unwrap();
+        let waited = put_started.elapsed();
+        assert!(
+            waited < SLOW_DROP / 2,
+            "a put waited {waited:?} for the sweep to free an evicted generation"
         );
 
         writer.close().await.unwrap();

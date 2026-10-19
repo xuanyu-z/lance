@@ -5,6 +5,8 @@
 //! testing what the memtable assumes about plugins it does not know.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -56,6 +58,19 @@ pub enum Deviation {
     PanicsOnInsert,
     /// Rejects its flush parameters.
     RejectsFlushParams,
+    /// Once it holds rows, takes [`SLOW_DROP`] to drop, as a large in-memory
+    /// index does to free its allocations.
+    SlowToDrop,
+}
+
+/// How long a [`Deviation::SlowToDrop`] index that holds rows takes to drop.
+pub const SLOW_DROP: Duration = Duration::from_secs(2);
+
+static SLOW_DROPS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many [`Deviation::SlowToDrop`] indexes holding rows have begun dropping.
+pub fn slow_drops_started() -> usize {
+    SLOW_DROPS_STARTED.load(Ordering::SeqCst)
 }
 
 /// `spec`, maintained by its plugin wrapped with `deviation`.
@@ -126,6 +141,7 @@ impl MemIndexPlugin for Wrapped {
         Ok(Arc::new(WrappedIndex {
             inner: self.inner.create(ctx)?,
             deviation: self.deviation,
+            holds_rows: AtomicBool::new(false),
         }))
     }
 }
@@ -134,6 +150,17 @@ impl MemIndexPlugin for Wrapped {
 struct WrappedIndex {
     inner: Arc<dyn MemIndex>,
     deviation: Deviation,
+    /// Set by the first insert.
+    holds_rows: AtomicBool,
+}
+
+impl Drop for WrappedIndex {
+    fn drop(&mut self) {
+        if self.deviation == Deviation::SlowToDrop && *self.holds_rows.get_mut() {
+            SLOW_DROPS_STARTED.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(SLOW_DROP);
+        }
+    }
 }
 
 /// A probe rather than a real search: a vector search for no neighbours, or a
@@ -165,6 +192,7 @@ impl MemIndex for WrappedIndex {
             self.deviation != Deviation::PanicsOnInsert,
             "insert panicked"
         );
+        self.holds_rows.store(true, Ordering::Relaxed);
         self.inner.insert(batch, row_offset)
     }
     fn resident_bytes(&self) -> usize {
