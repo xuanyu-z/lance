@@ -66,11 +66,21 @@ pub enum Deviation {
 /// How long a [`Deviation::SlowToDrop`] index that holds rows takes to drop.
 pub const SLOW_DROP: Duration = Duration::from_secs(2);
 
-static SLOW_DROPS_STARTED: AtomicUsize = AtomicUsize::new(0);
-
-/// How many [`Deviation::SlowToDrop`] indexes holding rows have begun dropping.
-pub fn slow_drops_started() -> usize {
-    SLOW_DROPS_STARTED.load(Ordering::SeqCst)
+/// `spec` with [`Deviation::SlowToDrop`], and a count of how many of its
+/// indexes holding rows have begun dropping. The count is per call, so tests
+/// running side by side do not see each other's drops.
+pub fn slow_to_drop(spec: MemIndexSpec) -> (MemIndexSpec, Arc<AtomicUsize>) {
+    let drops_started = Arc::new(AtomicUsize::new(0));
+    let spec = MemIndexSpec {
+        plugin: Arc::new(Wrapped {
+            inner: spec.plugin.clone(),
+            deviation: Deviation::SlowToDrop,
+            flush_params: None,
+            drops_started: Some(Arc::clone(&drops_started)),
+        }),
+        ..spec
+    };
+    (spec, drops_started)
 }
 
 /// `spec`, maintained by its plugin wrapped with `deviation`.
@@ -89,6 +99,7 @@ pub fn wrapped_with_flush_params(
             inner: spec.plugin.clone(),
             deviation,
             flush_params,
+            drops_started: None,
         }),
         ..spec
     }
@@ -99,6 +110,8 @@ struct Wrapped {
     inner: Arc<dyn MemIndexPlugin>,
     deviation: Deviation,
     flush_params: Option<ScalarIndexParams>,
+    /// Counts [`Deviation::SlowToDrop`] indexes that began dropping.
+    drops_started: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait::async_trait]
@@ -142,6 +155,7 @@ impl MemIndexPlugin for Wrapped {
             inner: self.inner.create(ctx)?,
             deviation: self.deviation,
             holds_rows: AtomicBool::new(false),
+            drops_started: self.drops_started.clone(),
         }))
     }
 }
@@ -152,12 +166,15 @@ struct WrappedIndex {
     deviation: Deviation,
     /// Set by the first insert.
     holds_rows: AtomicBool,
+    drops_started: Option<Arc<AtomicUsize>>,
 }
 
 impl Drop for WrappedIndex {
     fn drop(&mut self) {
         if self.deviation == Deviation::SlowToDrop && *self.holds_rows.get_mut() {
-            SLOW_DROPS_STARTED.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = &self.drops_started {
+                started.fetch_add(1, Ordering::SeqCst);
+            }
             std::thread::sleep(SLOW_DROP);
         }
     }
