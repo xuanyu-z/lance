@@ -1112,6 +1112,30 @@ struct ScalarIndexSelection {
     segment_uuids: Option<Arc<HashSet<Uuid>>>,
 }
 
+/// How often each scoring-column deprecation warning was reached: `_distance`,
+/// then `_score`. Only the first of each is logged.
+static SCORING_AUTOPROJECTION_WARNINGS: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Warn, once per process and column, that a search with an explicit
+/// projection still gets `column` (`_distance` or `_score`) appended.
+///
+/// The warning is about the caller's code, not about one query, so repeating
+/// it says nothing new. It is reached once per planned scanner, and a caller
+/// that plans one scanner per query, or several (an LSM read plans one per
+/// generation), would otherwise log it on every one.
+fn warn_scoring_autoprojection_once(column: &str) {
+    use std::sync::atomic::Ordering;
+    let slot = usize::from(column == SCORE_COL);
+    if SCORING_AUTOPROJECTION_WARNINGS[slot].fetch_add(1, Ordering::Relaxed) == 0 {
+        log::warn!(
+            "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `{column}`.  Currently the `{column}` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning. Logged once per process."
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct Scanner {
     dataset: Arc<Dataset>,
@@ -2933,9 +2957,7 @@ impl Scanner {
                 && output_expr.iter().all(|(_, name)| name != DIST_COL)
             {
                 if self.explicit_projection {
-                    log::warn!(
-                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
-                    );
+                    warn_scoring_autoprojection_once(DIST_COL);
                 }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
@@ -2944,9 +2966,7 @@ impl Scanner {
                 && output_expr.iter().all(|(_, name)| name != SCORE_COL)
             {
                 if self.explicit_projection {
-                    log::warn!(
-                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
-                    );
+                    warn_scoring_autoprojection_once(SCORE_COL);
                 }
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
