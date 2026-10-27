@@ -82,6 +82,39 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// For an `Update` that compacts MemWAL SSTables: the table's sharding
+    /// spec routes on primary-key columns only, so every key lives in exactly
+    /// one MemWAL shard ([`mem_wal_keys_shard_local`]). Two such updates that
+    /// compact different shards then insert disjoint keys, whatever their
+    /// inserted-rows filters say.
+    mem_wal_keys_shard_local: bool,
+}
+
+/// Whether every key the MemWAL of `dataset` routes lives in exactly one shard:
+/// the table has a sharding spec, and each of its fields is computed from
+/// key columns only (`key_field_ids`, the primary key the inserted-rows filter
+/// is built on). A deterministic function of the key sends equal keys to the
+/// same shard. Without a spec (unsharded, or shards managed by hand) nothing
+/// ties a key to a shard.
+async fn mem_wal_keys_shard_local(dataset: &Dataset, key_field_ids: &[i32]) -> Result<bool> {
+    let indices = dataset.load_indices().await?;
+    let Some(index) = indices.iter().find(|idx| idx.name == MEM_WAL_INDEX_NAME) else {
+        return Ok(false);
+    };
+    let details = load_mem_wal_index_details(index.clone())?;
+    Ok(!details.sharding_specs.is_empty()
+        && details.sharding_specs.iter().all(|spec| {
+            !spec.fields.is_empty()
+                && spec.fields.iter().all(|field| {
+                    !field.source_ids.is_empty()
+                        && field.source_ids.iter().all(|id| key_field_ids.contains(id))
+                })
+        }))
+}
+
+/// Whether two sets of compacted SSTables name no shard in common.
+fn compact_disjoint_shards(a: &[CompactedSsTable], b: &[CompactedSsTable]) -> bool {
+    !a.is_empty() && !b.is_empty() && a.iter().all(|x| b.iter().all(|y| x.shard_id != y.shard_id))
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -288,6 +321,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_keys_shard_local: false,
                 })
             }
             Operation::Delete {
@@ -305,6 +339,16 @@ impl<'a> TransactionRebase<'a> {
                     .map(|f| f.id)
                     .chain(deleted_fragment_ids.iter().copied())
                     .collect::<HashSet<_>>();
+                let mem_wal_keys_shard_local = match &transaction.operation {
+                    Operation::Update {
+                        compacted_sstables,
+                        inserted_rows_filter: Some(filter),
+                        ..
+                    } if !compacted_sstables.is_empty() => {
+                        mem_wal_keys_shard_local(dataset, &filter.field_ids).await?
+                    }
+                    _ => false,
+                };
 
                 // short circuit for full fragment update or delete case
                 // set affected_rows as None with non-empty modified_fragment_ids
@@ -325,6 +369,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        mem_wal_keys_shard_local,
                     });
                 }
 
@@ -346,6 +391,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_keys_shard_local,
                 })
             }
             Operation::Rewrite {
@@ -385,6 +431,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
+                    mem_wal_keys_shard_local: false,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -408,6 +455,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_keys_shard_local: false,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -431,6 +479,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_keys_shard_local: false,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -453,6 +502,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_keys_shard_local: false,
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
@@ -826,6 +876,7 @@ impl<'a> TransactionRebase<'a> {
         {
             if let Operation::Update {
                 inserted_rows_filter: other_inserted_rows_filter,
+                compacted_sstables: other_compacted_sstables,
                 ..
             } = &other_transaction.operation
             {
@@ -839,21 +890,32 @@ impl<'a> TransactionRebase<'a> {
                                 self.retryable_conflict_err(other_transaction, other_version)
                             );
                         }
-                        // Check for intersection. If the bloom filter configs don't match
-                        // (e.g., different number_of_items or probability), intersects() returns
-                        // an error and we treat it as a conflict to be safe.
-                        let Ok((has_intersection, _maybe_false_positive)) =
-                            self_keys.intersects(other_keys)
-                        else {
-                            // Bloom filter configs don't match - treat as conflict
-                            return Err(
-                                self.retryable_conflict_err(other_transaction, other_version)
+                        // Merges of different MemWAL shards insert disjoint keys when
+                        // the sharding spec routes on key columns only. The filters
+                        // cannot show it: each is a fixed-size bloom filter, and two of
+                        // them over a few thousand keys each intersect by chance.
+                        let shard_local = self.mem_wal_keys_shard_local
+                            && compact_disjoint_shards(
+                                self_compacted_sstables,
+                                other_compacted_sstables,
                             );
-                        };
-                        if has_intersection {
-                            return Err(
-                                self.retryable_conflict_err(other_transaction, other_version)
-                            );
+                        if !shard_local {
+                            // Check for intersection. If the bloom filter configs don't match
+                            // (e.g., different number_of_items or probability), intersects()
+                            // returns an error and we treat it as a conflict to be safe.
+                            let Ok((has_intersection, _maybe_false_positive)) =
+                                self_keys.intersects(other_keys)
+                            else {
+                                // Bloom filter configs don't match - treat as conflict
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            };
+                            if has_intersection {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
                         }
                     }
                     (Some(_), None) => {
@@ -4634,6 +4696,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
 
             let result = rebase.check_txn(&unknown, 1);
@@ -4877,6 +4940,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4944,6 +5008,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5093,6 +5158,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5143,6 +5209,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -5166,6 +5233,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -5254,6 +5322,7 @@ mod tests {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        mem_wal_keys_shard_local: false,
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -5312,6 +5381,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -5451,6 +5521,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
         let update = Transaction::new(
             1,
@@ -5519,6 +5590,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5581,6 +5653,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5610,6 +5683,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -5662,6 +5736,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let same_name = Transaction::new(
@@ -5725,6 +5800,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -5791,6 +5867,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -5840,6 +5917,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -5890,6 +5968,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -5967,6 +6046,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -6051,6 +6131,8 @@ mod tests {
                 reuse: Default::default(),
 
                 staged_replay: false,
+
+                mem_wal_keys_shard_local: false,
             };
             // Disjoint from the rewritten fragment, so this only exercises the
             // stable-row-ids check and not the group-straddling check below it.
@@ -6753,6 +6835,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                mem_wal_keys_shard_local: false,
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -6824,6 +6907,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6870,6 +6954,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6917,6 +7002,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6964,6 +7050,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7022,6 +7109,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7055,6 +7143,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -7109,6 +7198,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_keys_shard_local: false,
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
@@ -9715,5 +9805,176 @@ mod tests {
             assert_eq!(entry.index_version, 0);
             assert_eq!(count_mappings(&ledger), (0, 2));
         }
+    }
+}
+
+/// Concurrent MemWAL compaction merges into one base table: the bloom-filter
+/// key test is skipped only when the sharding spec ties every key to one shard
+/// and the two merges compact different shards.
+#[cfg(test)]
+mod mem_wal_shard_merge_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_array::{RecordBatch, UInt32Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_index::mem_wal::{CompactedSsTable, MemWalIndexDetails, ShardingField, ShardingSpec};
+    use uuid::Uuid;
+
+    use crate::Dataset;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::write::merge_insert::{
+        MergeInsertBuilder, UncommittedMergeInsert, WhenMatched, WhenNotMatched,
+    };
+    use crate::dataset::write::{CommitBuilder, InsertBuilder};
+    use crate::index::mem_wal::new_mem_wal_index_meta;
+
+    // Above the ~2-3k keys where two disjoint 8,192-key filters stop telling
+    // themselves apart, so a conflict here comes from the filter test.
+    const KEYS_PER_MERGE: u32 = 5_000;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false).with_metadata(HashMap::from([(
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            )])),
+            Field::new("value", DataType::UInt32, true),
+        ]))
+    }
+
+    fn batch(ids: std::ops::Range<u32>) -> RecordBatch {
+        let ids: Vec<u32> = ids.collect();
+        let values = ids.clone();
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(UInt32Array::from(ids)),
+                Arc::new(UInt32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A table keyed on `id` with a MemWAL index; `sharded` adds a two-bucket
+    /// spec computed from `id` (field 0).
+    async fn table(sharded: bool) -> Dataset {
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![batch(0..100)])
+            .await
+            .unwrap();
+        let mut details = MemWalIndexDetails::default();
+        if sharded {
+            details.num_shards = 2;
+            details.sharding_specs = vec![ShardingSpec {
+                spec_id: 1,
+                fields: vec![ShardingField {
+                    field_id: "bucket".to_string(),
+                    source_ids: vec![0],
+                    transform: Some("bucket".to_string()),
+                    expression: None,
+                    result_type: "int32".to_string(),
+                    parameters: HashMap::from([("num_buckets".to_string(), "2".to_string())]),
+                }],
+            }];
+        }
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![
+                    new_mem_wal_index_meta(dataset.manifest.version, details).unwrap(),
+                ],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap()
+    }
+
+    /// An uncommitted compaction-style merge of `ids` that marks `shard`'s
+    /// SSTables compacted.
+    async fn merge(dataset: &Arc<Dataset>, ids: std::ops::Range<u32>, shard: Uuid) -> Transaction {
+        let data = batch(ids);
+        let stream =
+            RecordBatchStreamAdapter::new(data.schema(), futures::stream::iter(vec![Ok(data)]));
+        let mut builder =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .mark_sstables_as_compacted(vec![CompactedSsTable::new(shard, 1)]);
+        let UncommittedMergeInsert { transaction, .. } = builder
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+            .await
+            .unwrap();
+        transaction
+    }
+
+    /// Two merges from the same read version; the second commits over the first.
+    async fn race(sharded: bool, same_shard: bool) -> crate::Result<Dataset> {
+        let dataset = Arc::new(table(sharded).await);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = merge(&dataset, 1_000..1_000 + KEYS_PER_MERGE, a).await;
+        let second = merge(
+            &dataset,
+            100_000..100_000 + KEYS_PER_MERGE,
+            if same_shard { a } else { b },
+        )
+        .await;
+        assert!(
+            matches!(
+                &second.operation,
+                Operation::Update {
+                    inserted_rows_filter: Some(_),
+                    ..
+                }
+            ),
+            "a merge on an unenforced primary key carries an inserted-rows filter"
+        );
+        CommitBuilder::new(dataset.clone())
+            .execute(first)
+            .await
+            .unwrap();
+        CommitBuilder::new(dataset).execute(second).await
+    }
+
+    #[tokio::test]
+    async fn test_merges_of_different_key_routed_shards_both_commit() {
+        let committed = race(true, false)
+            .await
+            .expect("disjoint shards must not conflict");
+        assert_eq!(
+            committed.count_rows(None).await.unwrap(),
+            100 + 2 * KEYS_PER_MERGE as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merges_of_the_same_shard_still_conflict() {
+        let err = race(true, true)
+            .await
+            .expect_err("same shard: the filter test applies");
+        assert!(
+            matches!(err, crate::Error::RetryableCommitConflict { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merges_without_a_sharding_spec_still_conflict() {
+        let err = race(false, false)
+            .await
+            .expect_err("no spec: nothing ties a key to a shard");
+        assert!(
+            matches!(err, crate::Error::RetryableCommitConflict { .. }),
+            "{err:?}"
+        );
     }
 }
